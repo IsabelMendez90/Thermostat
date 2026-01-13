@@ -1,4 +1,5 @@
 import streamlit as st
+from openai import OpenAI
 
 # =========================================================
 # Page config
@@ -17,72 +18,122 @@ if "humidity" not in st.session_state:
     st.session_state.humidity = 51
 if "air_quality" not in st.session_state:
     st.session_state.air_quality = "Fair"
-
-# Heat / Cool / Auto / Off
 if "hvac_mode" not in st.session_state:
-    st.session_state.hvac_mode = "Heat"
+    st.session_state.hvac_mode = "Heat"  # Heat / Cool / Auto / Off
 
 if "comfort" not in st.session_state:
     st.session_state.comfort = "Away"  # Home / Away / Sleep / Morning
 
-# When hvac_mode == Auto, which setpoint does the dial adjust?
-if "dial_kind" not in st.session_state:
-    st.session_state.dial_kind = "heat"  # "heat" | "cool"
-
-# Two setpoints per comfort: heat + cool
+# Two setpoints per comfort: Heat + Cool (like ecobee)
 if "setpoints" not in st.session_state:
     st.session_state.setpoints = {
-        "Home":    {"heat": 68, "cool": 75},
-        "Away":    {"heat": 64, "cool": 80},
-        "Sleep":   {"heat": 66, "cool": 78},
-        "Morning": {"heat": 67, "cool": 74},
+        "Home": {"heat": 68, "cool": 76},
+        "Away": {"heat": 64, "cool": 82},
+        "Sleep": {"heat": 66, "cool": 78},
+        "Morning": {"heat": 70, "cool": 75},
     }
+
+# Dial target (heat/cool)
+if "dial_target" not in st.session_state:
+    st.session_state.dial_target = "heat"  # "heat" or "cool"
+
+# LLM chat memory
+if "assistant_msgs" not in st.session_state:
+    st.session_state.assistant_msgs = []
 
 # =========================================================
 # Convenience
 # =========================================================
+def comfort_icon(name: str) -> str:
+    return {
+        "Home": "🏠",
+        "Away": "🚶",
+        "Sleep": "🌙",
+        "Morning": "☀️",
+    }.get(name, "✨")
+
 def clamp(v: int, lo: int = 45, hi: int = 90) -> int:
     return max(lo, min(hi, int(v)))
 
-def comfort_icon(name: str) -> str:
-    return {"Home": "🏠", "Away": "🚶", "Sleep": "🌙", "Morning": "☀️"}.get(name, "✨")
+def get_sp(comfort: str, target: str) -> int:
+    return int(st.session_state.setpoints.get(comfort, {}).get(target, 66))
 
-def get_sp(kind: str) -> int:
-    c = st.session_state.comfort
-    return int(st.session_state.setpoints[c][kind])
+def set_sp(comfort: str, target: str, v: int):
+    v = clamp(v)
+    if comfort not in st.session_state.setpoints:
+        st.session_state.setpoints[comfort] = {"heat": 66, "cool": 78}
+    st.session_state.setpoints[comfort][target] = v
 
-def set_sp(kind: str, v: int):
-    c = st.session_state.comfort
-    st.session_state.setpoints[c][kind] = clamp(v)
+def current_setpoint() -> int:
+    return get_sp(st.session_state.comfort, st.session_state.dial_target)
 
-def active_kind_for_mode() -> str:
-    mode = st.session_state.hvac_mode
-    if mode == "Heat":
-        return "heat"
-    if mode == "Cool":
-        return "cool"
-    # Auto: user chooses
-    return st.session_state.dial_kind
+def set_current_setpoint(v: int):
+    set_sp(st.session_state.comfort, st.session_state.dial_target, v)
 
-def pill_text() -> str:
-    mode = st.session_state.hvac_mode
-    h = get_sp("heat")
-    c = get_sp("cool")
-    if mode == "Auto":
-        return f"{h} / {c}"
-    if mode == "Heat":
-        return f"{h}"
-    if mode == "Cool":
-        return f"{c}"
-    return "—"
+def ico(symbol: str) -> str:
+    return f"<span style='font-size:16px; opacity:0.95'>{symbol}</span>"
+
+# =========================================================
+# OpenRouter (LLM)
+# =========================================================
+def get_or_client() -> OpenAI:
+    api_key = st.secrets.get("OPENROUTER_API_KEY", "")
+    if not api_key:
+        st.error("Missing OPENROUTER_API_KEY in Streamlit secrets.")
+        st.stop()
+    return OpenAI(base_url="https://openrouter.ai/api/v1", api_key=api_key)
+
+def llm_reply(user_text: str) -> str:
+    client = get_or_client()
+    site_url = st.secrets.get("YOUR_SITE_URL", "")
+    site_name = st.secrets.get("YOUR_SITE_NAME", "Streamlit Ecobee")
+
+    state = {
+        "view": st.session_state.get("view"),
+        "indoor_temp": st.session_state.get("indoor_temp"),
+        "humidity": st.session_state.get("humidity"),
+        "air_quality": st.session_state.get("air_quality"),
+        "hvac_mode": st.session_state.get("hvac_mode"),
+        "comfort": st.session_state.get("comfort"),
+        "dial_target": st.session_state.get("dial_target"),
+        "setpoints": st.session_state.get("setpoints"),
+    }
+
+    messages = [
+        {
+            "role": "system",
+            "content": (
+                "You are an ecobee-style thermostat assistant. "
+                "Be concise. If user asks to change heat/cool setpoints, "
+                "suggest exact values and explain briefly."
+            ),
+        },
+        {"role": "system", "content": f"Current thermostat state: {state}"},
+    ]
+
+    for m in st.session_state.assistant_msgs[-6:]:
+        messages.append(m)
+
+    messages.append({"role": "user", "content": user_text})
+
+    completion = client.chat.completions.create(
+        model="mistralai/devstral-2512:free",
+        messages=messages,
+        extra_headers={
+            "HTTP-Referer": site_url,
+            "X-Title": site_name,
+        },
+    )
+    return completion.choices[0].message.content.strip()
 
 # =========================================================
 # Styling (ecobee-ish)
 # =========================================================
 BASE_BG = "#111827"
+CARD_BG = "#1F2937"
 MUTED = "#9CA3AF"
 WHITE = "#F9FAFB"
-ACCENT = "#F97316"
+ACCENT = "#F97316"   # orange (heat-ish)
 TEAL = "#22C55E"
 
 st.markdown(
@@ -100,7 +151,7 @@ st.markdown(
       .frame {{
         max-width: 430px;
         margin: 0 auto;
-        padding: 18px 14px 92px 14px;
+        padding: 18px 14px 160px 14px; /* extra room for assistant bar + bottom nav */
       }}
 
       .topbar {{
@@ -147,45 +198,54 @@ st.markdown(
         align-items:center;
       }}
 
-      /* ONLY the pill button */
-      .pillwrap {{
-        width: 160px;
-        margin: 18px auto 0 auto;
+      /* HOME setpoint pills (Heat/Cool) */
+      .pillRow {{
+        display:flex;
+        justify-content:center;
+        gap: 12px;
+        margin-top: 18px;
       }}
-      .pillwrap div.stButton > button {{
-        width: 160px !important;
+      .pill {{
+        width: 132px;
+        border-radius: 999px;
+        padding: 10px 0;
+        text-align:center;
+        border: 2px solid rgba(255,255,255,0.14);
+        color: rgba(255,255,255,0.92);
+        font-weight: 800;
+        letter-spacing: 0.4px;
+        background: rgba(255,255,255,0.03);
+        font-size: 16px;
+      }}
+      .pill .label {{
+        display:flex;
+        justify-content:center;
+        gap: 8px;
+        align-items:center;
+        font-size: 12px;
+        color: rgba(255,255,255,0.65);
+        font-weight: 650;
+        margin-bottom: 2px;
+      }}
+      .pill.heat {{
+        border-color: rgba(249,115,22,0.75);
+        color: {ACCENT};
+        background: rgba(249,115,22,0.06);
+      }}
+      .pill.cool {{
+        border-color: rgba(96,165,250,0.75);
+        color: rgba(96,165,250,0.95);
+        background: rgba(96,165,250,0.06);
+      }}
+
+      /* Make Streamlit buttons less Streamlit (global) */
+      div.stButton > button {{
         border-radius: 999px !important;
-        border: 2px solid {ACCENT} !important;
-        background: rgba(249,115,22,0.06) !important;
-        color: {ACCENT} !important;
-        font-weight: 850 !important;
-        letter-spacing: 0.4px !important;
-        padding: 10px 0 !important;
-        font-size: 20px !important;
+        border: 1px solid rgba(255,255,255,0.12) !important;
+        background: rgba(255,255,255,0.03) !important;
+        color: {WHITE} !important;
+        padding: 10px 14px !important;
       }}
-
-      .card {{
-        background: rgba(31,41,55,0.9);
-        border: 1px solid rgba(255,255,255,0.08);
-        border-radius: 18px;
-        padding: 14px 14px;
-      }}
-
-      .row {{
-        display:flex; justify-content:space-between; align-items:center;
-        padding: 12px 4px;
-        border-bottom: 1px solid rgba(255,255,255,0.06);
-      }}
-      .row:last-child {{ border-bottom: none; }}
-      .row .left {{
-        display:flex; align-items:center; gap: 12px;
-        color: {WHITE};
-        font-size: 18px;
-      }}
-      .row .sub {{
-        font-size: 13px; color: {MUTED}; margin-top: 2px;
-      }}
-      .chev {{ color: rgba(255,255,255,0.55); font-size: 22px; }}
 
       /* Dial */
       .dialWrap {{
@@ -207,13 +267,15 @@ st.markdown(
       .dialCenter {{
         width: 220px; height: 220px;
         border-radius: 44px;
-        background: {ACCENT};
         display:flex; align-items:center; justify-content:center;
         color: {WHITE};
         font-size: 96px;
         font-weight: 300;
         box-shadow: 0 12px 40px rgba(0,0,0,0.35);
       }}
+      .dialCenter.heat {{ background: {ACCENT}; }}
+      .dialCenter.cool {{ background: rgba(96,165,250,0.95); }}
+
       .dialBtnCol {{
         position:absolute;
         right: 10px;
@@ -225,11 +287,11 @@ st.markdown(
         width: 58px !important;
         height: 58px !important;
         border-radius: 999px !important;
-        border: 2px solid {ACCENT} !important;
-        background: rgba(249,115,22,0.06) !important;
-        color: {ACCENT} !important;
+        border: 2px solid rgba(255,255,255,0.14) !important;
+        background: rgba(255,255,255,0.05) !important;
+        color: {WHITE} !important;
         font-size: 28px !important;
-        font-weight: 850 !important;
+        font-weight: 800 !important;
         padding: 0 !important;
       }}
 
@@ -260,19 +322,51 @@ st.markdown(
         width: 10px; height: 10px; border-radius: 999px;
         background: rgba(255,255,255,0.12);
       }}
-      .navitem.active {{
-        color: {TEAL};
+      .navitem.active {{ color: {TEAL}; }}
+      .navitem.active .navdot {{ background: {TEAL}; }}
+
+      /* Assistant bar (fixed above bottom nav) */
+      .assistantbar {{
+        position: fixed;
+        left: 0; right: 0;
+        bottom: 86px;
+        padding: 10px 0 12px 0;
+        pointer-events: none;
       }}
-      .navitem.active .navdot {{
-        background: {TEAL};
+      .assistantbar .inner {{
+        max-width: 430px;
+        margin: 0 auto;
+        padding: 0 14px;
+        pointer-events: auto;
+      }}
+      .assistantbubble {{
+        width: 100%;
+        border-radius: 18px;
+        border: 1px solid rgba(255,255,255,0.10);
+        background: rgba(17,24,39,0.75);
+        backdrop-filter: blur(10px);
+        padding: 10px 12px;
+      }}
+      .assistantbubble .reply {{
+        color: rgba(255,255,255,0.88);
+        font-size: 13px;
+        line-height: 1.3;
+        margin-bottom: 8px;
+        max-height: 48px;
+        overflow: hidden;
+      }}
+      .assistantbubble .hint {{
+        color: rgba(156,163,175,0.95);
+        font-size: 11px;
+        margin-top: 6px;
       }}
 
-      /* Inputs */
-      .stTextInput input {{
+      .assistantInput .stTextInput input {{
+        height: 38px !important;
+        border-radius: 14px !important;
         background: rgba(255,255,255,0.04) !important;
         border: 1px solid rgba(255,255,255,0.10) !important;
         color: {WHITE} !important;
-        border-radius: 14px !important;
       }}
     </style>
     """,
@@ -282,9 +376,6 @@ st.markdown(
 # =========================================================
 # UI helpers
 # =========================================================
-def ico(symbol: str) -> str:
-    return f"<span style='font-size:16px; opacity:0.95'>{symbol}</span>"
-
 def topbar(title: str, left_symbol="👤", right_symbol="⚙", left_hint="User", right_hint="Settings"):
     st.markdown(
         f"""
@@ -300,15 +391,15 @@ def topbar(title: str, left_symbol="👤", right_symbol="⚙", left_hint="User",
 def bottom_nav():
     c1, c2, c3 = st.columns(3)
     with c1:
-        if st.button("Home", use_container_width=True, key="nav_home"):
+        if st.button("Home", use_container_width=True):
             st.session_state.view = "Home"
             st.rerun()
     with c2:
-        if st.button("Reports", use_container_width=True, key="nav_reports"):
+        if st.button("Reports", use_container_width=True):
             st.session_state.view = "Reports"
             st.rerun()
     with c3:
-        if st.button("Menu", use_container_width=True, key="nav_menu"):
+        if st.button("Menu", use_container_width=True):
             st.session_state.view = "Menu"
             st.rerun()
 
@@ -332,6 +423,59 @@ def bottom_nav():
         unsafe_allow_html=True,
     )
 
+def assistant_bar():
+    last_reply = "Message me: “Set Sleep heat to 66” or “What are my setpoints?”"
+    for m in reversed(st.session_state.assistant_msgs):
+        if m["role"] == "assistant":
+            last_reply = m["content"]
+            break
+
+    st.markdown(
+        """
+        <div class="assistantbar">
+          <div class="inner">
+            <div class="assistantbubble">
+        """,
+        unsafe_allow_html=True,
+    )
+
+    st.markdown(f"<div class='reply'>{last_reply}</div>", unsafe_allow_html=True)
+
+    c1, c2 = st.columns([6, 1])
+    with c1:
+        st.markdown("<div class='assistantInput'>", unsafe_allow_html=True)
+        user_text = st.text_input(
+            "Assistant input",
+            placeholder="Message the thermostat…",
+            key="assistant_input",
+            label_visibility="collapsed",
+        )
+        st.markdown("</div>", unsafe_allow_html=True)
+    with c2:
+        send = st.button("➤", key="assistant_send")
+
+    if send and user_text.strip():
+        st.session_state.assistant_msgs.append({"role": "user", "content": user_text.strip()})
+        with st.spinner("Thinking…"):
+            reply = llm_reply(user_text.strip())
+        st.session_state.assistant_msgs.append({"role": "assistant", "content": reply})
+        st.session_state.assistant_input = ""
+        st.rerun()
+
+    st.markdown(
+        "<div class='hint'>Tip: The assistant has access to current mode, comfort, and heat/cool setpoints.</div>",
+        unsafe_allow_html=True,
+    )
+
+    st.markdown(
+        """
+            </div>
+          </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
 # =========================================================
 # Views
 # =========================================================
@@ -339,6 +483,9 @@ st.markdown('<div class="frame">', unsafe_allow_html=True)
 
 if st.session_state.view == "Home":
     topbar("My ecobee", left_symbol="👤", right_symbol="⚙")
+
+    heat_sp = get_sp(st.session_state.comfort, "heat")
+    cool_sp = get_sp(st.session_state.comfort, "cool")
 
     st.markdown(
         f"""
@@ -353,43 +500,43 @@ if st.session_state.view == "Home":
         <div class="comfortline">
           {ico(comfort_icon(st.session_state.comfort))} <span>{st.session_state.comfort}</span>
         </div>
+
+        <div class="pillRow">
+          <div class="pill heat">
+            <div class="label">{ico('🔥')} Heat</div>
+            <div style="font-size:20px;">{heat_sp}</div>
+          </div>
+          <div class="pill cool">
+            <div class="label">{ico('❄️')} Cool</div>
+            <div style="font-size:20px;">{cool_sp}</div>
+          </div>
+        </div>
         """,
         unsafe_allow_html=True,
     )
 
+    # Real buttons aligned under the visual pills (no "new windows"; just state change)
+    colA, colB = st.columns(2)
+    with colA:
+        if st.button("Adjust Heat", use_container_width=True):
+            st.session_state.dial_target = "heat"
+            st.session_state.view = "Dial"
+            st.rerun()
+    with colB:
+        if st.button("Adjust Cool", use_container_width=True):
+            st.session_state.dial_target = "cool"
+            st.session_state.view = "Dial"
+            st.rerun()
 
-    st.markdown('<div class="pillwrap">', unsafe_allow_html=True)
-    if st.button(pill_text(), key="pill_btn", help="Tap to adjust setpoint"):
-        st.session_state.view = "Dial"
-        st.rerun()
-    st.markdown("</div>", unsafe_allow_html=True)
-
-    st.markdown("<div style='height:14px'></div>", unsafe_allow_html=True)
-    st.caption("Tip: tap the orange setpoint to adjust it (Dial).")
+    st.caption("Tip: Adjust heat/cool setpoints using the Dial.")
 
 elif st.session_state.view == "Dial":
-    topbar("", left_symbol="←", right_symbol="")
+    target = st.session_state.dial_target
+    topbar("Setpoint", left_symbol="←", right_symbol="")
 
-    # Back behavior (simple + predictable)
-    back = st.button("Back", key="dial_back")
-    if back:
-        st.session_state.view = "Home"
-        st.rerun()
-
-    # If Auto, choose which setpoint to edit
-    if st.session_state.hvac_mode == "Auto":
-        choice = st.radio(
-            "Adjust which setpoint",
-            ["Heat 🔥", "Cool ❄️"],
-            horizontal=True,
-            label_visibility="collapsed",
-            index=0 if st.session_state.dial_kind == "heat" else 1,
-            key="dial_choice",
-        )
-        st.session_state.dial_kind = "heat" if "Heat" in choice else "cool"
-
-    kind = active_kind_for_mode()
-    sp = get_sp(kind)
+    sp = current_setpoint()
+    center_class = "heat" if target == "heat" else "cool"
+    label = "🔥 Heat" if target == "heat" else "❄️ Cool"
 
     st.markdown('<div class="dialWrap">', unsafe_allow_html=True)
 
@@ -406,7 +553,7 @@ elif st.session_state.view == "Dial":
         unsafe_allow_html=True,
     )
 
-    st.markdown(f'<div class="dialCenter">{sp}</div>', unsafe_allow_html=True)
+    st.markdown(f'<div class="dialCenter {center_class}">{sp}</div>', unsafe_allow_html=True)
 
     st.markdown('<div class="dialBtnCol">', unsafe_allow_html=True)
     plus = st.button("＋", key="dial_plus")
@@ -416,140 +563,107 @@ elif st.session_state.view == "Dial":
     st.markdown("</div>", unsafe_allow_html=True)
 
     if plus:
-        set_sp(kind, sp + 1)
+        set_current_setpoint(sp + 1)
         st.rerun()
     if minus:
-        set_sp(kind, sp - 1)
+        set_current_setpoint(sp - 1)
         st.rerun()
 
-    # Show both setpoints for context (ecobee vibes)
-    st.markdown("<div style='height:8px'></div>", unsafe_allow_html=True)
-    st.write(
-        f"Active comfort: **{st.session_state.comfort}**  •  "
-        f"🔥 {get_sp('heat')}  |  ❄️ {get_sp('cool')}"
-    )
+    st.write(f"Editing: **{label}** for **{st.session_state.comfort}**")
+
+    if st.button("Back to Home", use_container_width=True):
+        st.session_state.view = "Home"
+        st.rerun()
 
 elif st.session_state.view == "Reports":
     topbar("Reports", left_symbol="＋", right_symbol="👤", left_hint="Add", right_hint="Profile")
     st.markdown(
         f"""
-        <div class="card">
+        <div style="background: rgba(31,41,55,0.9); border: 1px solid rgba(255,255,255,0.08);
+                    border-radius: 18px; padding: 14px 14px;">
           <div style="font-size:18px; font-weight:650; margin-bottom:8px;">Quick Stats</div>
           <div style="color:rgba(255,255,255,0.72); line-height:1.5;">
             • Indoor temp: <b>{st.session_state.indoor_temp}</b><br/>
             • HVAC mode: <b>{st.session_state.hvac_mode}</b><br/>
             • Humidity: <b>{st.session_state.humidity}%</b><br/>
             • Comfort: <b>{st.session_state.comfort}</b> ({comfort_icon(st.session_state.comfort)})<br/>
-            • Setpoints: 🔥 <b>{get_sp('heat')}</b> | ❄️ <b>{get_sp('cool')}</b><br/>
           </div>
         </div>
         """,
         unsafe_allow_html=True,
     )
-
-    st.markdown("<div style='height:12px'></div>", unsafe_allow_html=True)
-    st.info("Later: connect this to real runtime/setpoint/cluster metrics. For now it’s a nice-looking lie. 😄")
+    st.info("Hook your real telemetry later (runtime, clusters, schedules). This is the placeholder tab.")
 
 elif st.session_state.view == "Menu":
     topbar("Main Menu", left_symbol="✕", right_symbol="")
-    st.text_input("Search thermostat settings", placeholder="Search thermostat settings", key="menu_search")
+    st.text_input("Search thermostat settings", placeholder="Search thermostat settings")
 
     st.markdown(
         f"""
-        <div class="card">
-          <div class="row">
-            <div class="left">{ico('e')} <div><div><b>eco+</b></div><div class="sub">Enabled</div></div></div>
-            <div class="chev">›</div>
+        <div style="background: rgba(31,41,55,0.9); border: 1px solid rgba(255,255,255,0.08);
+                    border-radius: 18px; padding: 14px 14px;">
+          <div style="padding: 12px 4px; border-bottom: 1px solid rgba(255,255,255,0.06); display:flex; justify-content:space-between;">
+            <div style="display:flex; gap:12px; align-items:center;">{ico('e')} <b>eco+</b></div><div style="opacity:0.55;">›</div>
           </div>
-
-          <div class="row">
-            <div class="left">{ico('🛠')} <div><div><b>System</b></div><div class="sub">HVAC Mode: {st.session_state.hvac_mode}</div></div></div>
-            <div class="chev">›</div>
+          <div style="padding: 12px 4px; border-bottom: 1px solid rgba(255,255,255,0.06); display:flex; justify-content:space-between;">
+            <div style="display:flex; gap:12px; align-items:center;">{ico('🛠')} <b>System</b></div><div style="opacity:0.55;">›</div>
           </div>
-
-          <div class="row">
-            <div class="left">{ico('🌬')} <div><div><b>Air Quality</b></div><div class="sub">{st.session_state.air_quality}</div></div></div>
-            <div class="chev">›</div>
-          </div>
-
-          <div class="row">
-            <div class="left">{ico('🛋')} <div><div><b>Comfort Settings</b></div><div class="sub">Home / Away / Sleep / Morning</div></div></div>
-            <div class="chev">›</div>
+          <div style="padding: 12px 4px; border-bottom: 1px solid rgba(255,255,255,0.06); display:flex; justify-content:space-between;">
+            <div style="display:flex; gap:12px; align-items:center;">{ico('🛋')} <b>Comfort Settings</b></div><div style="opacity:0.55;">›</div>
           </div>
         </div>
         """,
         unsafe_allow_html=True,
     )
 
-    st.markdown("<div style='height:12px'></div>", unsafe_allow_html=True)
-    if st.button("Open Comfort Settings", key="open_comfort"):
+    if st.button("Open Comfort Settings", use_container_width=True):
         st.session_state.view = "Comfort"
         st.rerun()
-
-    # Optional: quick HVAC mode switch for testing
-    st.markdown("<div style='height:10px'></div>", unsafe_allow_html=True)
-    st.session_state.hvac_mode = st.selectbox(
-        "HVAC mode",
-        ["Heat", "Cool", "Auto", "Off"],
-        index=["Heat", "Cool", "Auto", "Off"].index(st.session_state.hvac_mode),
-        key="hvac_mode_select",
-    )
 
 elif st.session_state.view == "Comfort":
     topbar("Comfort Settings", left_symbol="←", right_symbol="＋")
 
-    if st.button("Back", key="comfort_back"):
-        st.session_state.view = "Menu"
-        st.rerun()
-
     st.markdown(
         """
         <div style="color:rgba(255,255,255,0.7); font-size:15px; line-height:1.4; margin-bottom:14px;">
-          Comfort settings make sure your home is the right temperature during specific activities in your schedule.
+          Each comfort has two setpoints: Heat (🔥) and Cool (❄️).
         </div>
         """,
         unsafe_allow_html=True,
     )
 
-    # Two setpoints per comfort: Heat + Cool
     for k in list(st.session_state.setpoints.keys()):
-        rowA, rowB, rowC = st.columns([1.6, 1.0, 1.0])
-
-        with rowA:
+        colA, colB, colC = st.columns([2.2, 1.2, 1.2])
+        with colA:
             st.write(f"**{comfort_icon(k)} {k}**")
-
-        with rowB:
-            h = st.number_input(
-                "Heat setpoint",
-                value=int(st.session_state.setpoints[k]["heat"]),
+        with colB:
+            v_heat = st.number_input(
+                label=f"Heat setpoint for {k}",
+                value=int(get_sp(k, "heat")),
                 key=f"heat_{k}",
                 label_visibility="collapsed",
                 step=1,
             )
-            st.session_state.setpoints[k]["heat"] = clamp(h)
-
-        with rowC:
-            c = st.number_input(
-                "Cool setpoint",
-                value=int(st.session_state.setpoints[k]["cool"]),
+            set_sp(k, "heat", int(v_heat))
+        with colC:
+            v_cool = st.number_input(
+                label=f"Cool setpoint for {k}",
+                value=int(get_sp(k, "cool")),
                 key=f"cool_{k}",
                 label_visibility="collapsed",
                 step=1,
             )
-            st.session_state.setpoints[k]["cool"] = clamp(c)
-
-        # Tiny hint row (like ecobee icons)
-        st.caption(f"🔥 {st.session_state.setpoints[k]['heat']}    ❄️ {st.session_state.setpoints[k]['cool']}")
+            set_sp(k, "cool", int(v_cool))
 
     st.markdown("<div style='height:10px'></div>", unsafe_allow_html=True)
     st.session_state.comfort = st.selectbox(
         "Active comfort",
         list(st.session_state.setpoints.keys()),
         index=list(st.session_state.setpoints.keys()).index(st.session_state.comfort),
-        key="active_comfort_select",
     )
 
 st.markdown("</div>", unsafe_allow_html=True)
 
-# Bottom nav
+# Fixed assistant bar + bottom nav
+assistant_bar()
 bottom_nav()
