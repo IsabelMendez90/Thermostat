@@ -1,3 +1,8 @@
+import json
+import re
+from typing import Any, Dict, Optional, Tuple
+
+import requests
 import streamlit as st
 from openai import OpenAI
 
@@ -9,50 +14,53 @@ st.set_page_config(page_title="Ecobee-style UI (Streamlit)", layout="centered")
 # =========================================================
 # Session state defaults
 # =========================================================
-if "view" not in st.session_state:
-    st.session_state.view = "Home"   # Home | Dial | Reports | Menu | Comfort
+def init_state():
+    ss = st.session_state
 
-if "indoor_temp" not in st.session_state:
-    st.session_state.indoor_temp = 78
-if "humidity" not in st.session_state:
-    st.session_state.humidity = 51
-if "air_quality" not in st.session_state:
-    st.session_state.air_quality = "Fair"
+    ss.setdefault("view", "Home")  # Home | Dial | Reports | Menu | Comfort
 
-# System mode + fan mode (NEW)
-if "hvac_mode" not in st.session_state:
-    st.session_state.hvac_mode = "Heat"  # Heat / Cool / Auto / Off
-if "fan_mode" not in st.session_state:
-    st.session_state.fan_mode = "Auto"   # Auto / On
+    ss.setdefault("indoor_temp", 78)
+    ss.setdefault("humidity", 51)
+    ss.setdefault("air_quality", "Fair")
 
-if "comfort" not in st.session_state:
-    st.session_state.comfort = "Away"  # Home / Away / Sleep / Morning
+    # HVAC + fan
+    ss.setdefault("hvac_mode", "Heat")  # Off / Heat / Cool / Auto / Aux
+    ss.setdefault("fan_on", False)      # False=Auto, True=On
 
-# Two setpoints per comfort: Heat + Cool
-if "setpoints" not in st.session_state:
-    st.session_state.setpoints = {
-        "Home": {"heat": 68, "cool": 76},
-        "Away": {"heat": 64, "cool": 82},
-        "Sleep": {"heat": 66, "cool": 78},
-        "Morning": {"heat": 70, "cool": 75},
-    }
+    # Comfort + setpoints
+    ss.setdefault("comfort", "Away")
+    ss.setdefault(
+        "setpoints",
+        {
+            "Home": {"heat": 68, "cool": 76},
+            "Away": {"heat": 64, "cool": 82},
+            "Sleep": {"heat": 66, "cool": 78},
+            "Morning": {"heat": 70, "cool": 75},
+        },
+    )
+    ss.setdefault("dial_target", "heat")  # heat or cool
 
-# Dial target (heat/cool)
-if "dial_target" not in st.session_state:
-    st.session_state.dial_target = "heat"  # "heat" or "cool"
+    # Assistant
+    ss.setdefault("assistant_messages", [])
+    ss.setdefault("assistant_last_reply", "Ask me anything about your thermostat.")
+    ss.setdefault("pending_action", None)   # dict or None
+    ss.setdefault("pending_explainer", "")  # why/impact text from assistant
 
-# LLM messages
-if "assistant_messages" not in st.session_state:
-    st.session_state.assistant_messages = []  # [{"role":"user|assistant","content":"..."}]
+    # Location + weather
+    ss.setdefault("location", "Berkeley, CA")
+    ss.setdefault("outdoor_temp_f", None)  # float or None
+    ss.setdefault("weather_status", "Not updated")
 
-if "assistant_last_reply" not in st.session_state:
-    st.session_state.assistant_last_reply = "Ask me anything about your thermostat."
+init_state()
 
 # =========================================================
 # Convenience
 # =========================================================
 def comfort_icon(name: str) -> str:
     return {"Home": "🏠", "Away": "🚶", "Sleep": "🌙", "Morning": "☀️"}.get(name, "✨")
+
+def ico(symbol: str) -> str:
+    return f"<span style='font-size:16px; opacity:0.95'>{symbol}</span>"
 
 def clamp(v: int, lo: int = 45, hi: int = 90) -> int:
     return max(lo, min(hi, int(v)))
@@ -62,8 +70,7 @@ def get_sp(comfort: str, target: str) -> int:
 
 def set_sp(comfort: str, target: str, v: int):
     v = clamp(v)
-    if comfort not in st.session_state.setpoints:
-        st.session_state.setpoints[comfort] = {"heat": 66, "cool": 78}
+    st.session_state.setpoints.setdefault(comfort, {"heat": 66, "cool": 78})
     st.session_state.setpoints[comfort][target] = v
 
 def current_setpoint() -> int:
@@ -72,11 +79,53 @@ def current_setpoint() -> int:
 def set_current_setpoint(v: int):
     set_sp(st.session_state.comfort, st.session_state.dial_target, v)
 
-def ico(symbol: str) -> str:
-    return f"<span style='font-size:16px; opacity:0.95'>{symbol}</span>"
+def fan_label() -> str:
+    return "On" if st.session_state.fan_on else "Auto"
 
 # =========================================================
-# OpenRouter (LLM)
+# Weather via Open-Meteo (free, no key)
+# =========================================================
+def f_from_c(c: float) -> float:
+    return c * 9.0 / 5.0 + 32.0
+
+def fetch_openmeteo_outdoor_temp_f(location_text: str) -> Tuple[Optional[float], str]:
+    """
+    Uses Open-Meteo geocoding + current weather.
+    Returns (temp_f or None, status message).
+    """
+    try:
+        geo = requests.get(
+            "https://geocoding-api.open-meteo.com/v1/search",
+            params={"name": location_text, "count": 1, "language": "en", "format": "json"},
+            timeout=10,
+        )
+        geo.raise_for_status()
+        gj = geo.json()
+        if not gj.get("results"):
+            return None, "Location not found"
+
+        r = gj["results"][0]
+        lat, lon = r["latitude"], r["longitude"]
+        nice_name = f"{r.get('name','')}, {r.get('admin1','')}, {r.get('country_code','')}".strip(", ")
+
+        wx = requests.get(
+            "https://api.open-meteo.com/v1/forecast",
+            params={"latitude": lat, "longitude": lon, "current_weather": True, "temperature_unit": "celsius"},
+            timeout=10,
+        )
+        wx.raise_for_status()
+        wj = wx.json()
+        cw = wj.get("current_weather", {})
+        if "temperature" not in cw:
+            return None, f"Weather unavailable for {nice_name}"
+
+        temp_f = f_from_c(float(cw["temperature"]))
+        return temp_f, f"Updated from Open-Meteo for {nice_name}"
+    except Exception as e:
+        return None, f"Weather error: {e}"
+
+# =========================================================
+# OpenRouter client
 # =========================================================
 def get_openrouter_client() -> OpenAI:
     api_key = st.secrets.get("OPENROUTER_API_KEY", "")
@@ -85,43 +134,76 @@ def get_openrouter_client() -> OpenAI:
         st.stop()
     return OpenAI(base_url="https://openrouter.ai/api/v1", api_key=api_key)
 
-def call_openrouter(user_text: str, model: str = "mistralai/devstral-2512:free") -> str:
-    client = get_openrouter_client()
-    site_url = st.secrets.get("YOUR_SITE_URL", "")
-    site_name = st.secrets.get("YOUR_SITE_NAME", "Streamlit Ecobee")
-
-    state = {
-        "hvac_mode": st.session_state.hvac_mode,
-        "fan_mode": st.session_state.fan_mode,
-        "comfort": st.session_state.comfort,
-        "indoor_temp": st.session_state.indoor_temp,
-        "humidity": st.session_state.humidity,
+def thermostat_state_summary() -> Dict[str, Any]:
+    return {
+        "indoor_temp_f": st.session_state.indoor_temp,
+        "outdoor_temp_f": st.session_state.outdoor_temp_f,
+        "humidity_pct": st.session_state.humidity,
         "air_quality": st.session_state.air_quality,
-        "active_setpoints": st.session_state.setpoints.get(st.session_state.comfort, {}),
-        "available_controls": {
-            "hvac_mode": ["Heat", "Cool", "Auto", "Off"],
-            "fan_mode": ["Auto", "On"],
-            "comfort": list(st.session_state.setpoints.keys()),
+        "hvac_mode": st.session_state.hvac_mode,
+        "fan": fan_label(),
+        "comfort": st.session_state.comfort,
+        "setpoints_active": st.session_state.setpoints.get(st.session_state.comfort, {}),
+        "location": st.session_state.location,
+        "controls_available": {
+            "hvac_modes": ["Off", "Heat", "Cool", "Auto", "Aux"],
+            "fan_toggle": ["Auto", "On"],
+            "comforts": list(st.session_state.setpoints.keys()),
             "setpoints": ["heat", "cool"],
         },
     }
 
+ACTION_TAG_RE = re.compile(r"<ACTION>\s*(\{.*?\})\s*</ACTION>", re.DOTALL)
+
+def parse_action_from_text(text: str) -> Tuple[Optional[Dict[str, Any]], str]:
+    """
+    Looks for an <ACTION>{json}</ACTION> block.
+    Returns (action_dict_or_none, cleaned_text_without_action_block).
+    """
+    m = ACTION_TAG_RE.search(text)
+    if not m:
+        return None, text.strip()
+
+    raw = m.group(1)
+    try:
+        action = json.loads(raw)
+    except Exception:
+        # If the model outputs broken JSON, treat as non-action
+        return None, text.strip()
+
+    cleaned = ACTION_TAG_RE.sub("", text).strip()
+    return action, cleaned
+
+def call_openrouter(user_text: str, model: str = "mistralai/devstral-2512:free") -> Tuple[str, Optional[Dict[str, Any]]]:
+    client = get_openrouter_client()
+    site_url = st.secrets.get("YOUR_SITE_URL", "")
+    site_name = st.secrets.get("YOUR_SITE_NAME", "Streamlit Ecobee")
+
+    state = thermostat_state_summary()
     history = st.session_state.assistant_messages[-8:]
 
+    system = (
+        "You are an ecobee-style thermostat assistant inside a Streamlit UI.\n"
+        "You MUST follow this protocol:\n"
+        "1) First give a short helpful answer.\n"
+        "2) If (and only if) the user requests a change that exists in UI, propose ONE action.\n"
+        "3) Proposed actions MUST be encoded in a single JSON block inside tags exactly like:\n"
+        "<ACTION>{\"type\":\"set_hvac_mode\",\"mode\":\"Auto\"}</ACTION>\n\n"
+        "Allowed action types and schemas:\n"
+        "- set_hvac_mode: {\"type\":\"set_hvac_mode\",\"mode\":\"Off|Heat|Cool|Auto|Aux\"}\n"
+        "- set_fan: {\"type\":\"set_fan\",\"fan\":\"Auto|On\"}\n"
+        "- set_comfort: {\"type\":\"set_comfort\",\"comfort\":\"Home|Away|Sleep|Morning\"}\n"
+        "- set_setpoint: {\"type\":\"set_setpoint\",\"target\":\"heat|cool\",\"value\":INT,\"comfort\":\"(optional)\"}\n"
+        "- set_location: {\"type\":\"set_location\",\"location\":\"text\"}\n\n"
+        "Important:\n"
+        "- Never claim the change has already happened. Only propose it.\n"
+        "- Mention comfort/energy tradeoffs briefly before proposing the action.\n"
+        "- If the user asks for climate reasoning, use location and outdoor_temp if available.\n"
+    )
+
     messages = [
-        {
-            "role": "system",
-            "content": (
-                "You are an ecobee-style thermostat assistant inside a Streamlit UI.\n"
-                "Only recommend actions that exist in the UI: change HVAC mode (Heat/Cool/Auto/Off), "
-                "change Fan mode (Auto/On), change Comfort (Home/Away/Sleep/Morning), "
-                "and adjust heat/cool setpoints.\n"
-                "Be concise and practical. If you recommend switching a mode, say exactly which mode.\n"
-                "If asked to change setpoints, propose exact HEAT and/or COOL values.\n"
-                "Do NOT mention controls that are not available."
-            ),
-        },
-        {"role": "system", "content": f"Current thermostat state: {state}"},
+        {"role": "system", "content": system},
+        {"role": "system", "content": f"Current thermostat state (JSON): {json.dumps(state)}"},
         *history,
         {"role": "user", "content": user_text},
     ]
@@ -131,7 +213,69 @@ def call_openrouter(user_text: str, model: str = "mistralai/devstral-2512:free")
         messages=messages,
         extra_headers={"HTTP-Referer": site_url, "X-Title": site_name},
     )
-    return completion.choices[0].message.content.strip()
+
+    raw = completion.choices[0].message.content.strip()
+    action, cleaned = parse_action_from_text(raw)
+    return cleaned, action
+
+def apply_action(action: Dict[str, Any]) -> str:
+    """
+    Applies action to session_state. Returns a short status string.
+    """
+    t = action.get("type")
+
+    if t == "set_hvac_mode":
+        mode = action.get("mode")
+        if mode in ["Off", "Heat", "Cool", "Auto", "Aux"]:
+            st.session_state.hvac_mode = mode
+            return f"Applied: HVAC mode → {mode}"
+        return "Invalid HVAC mode"
+
+    if t == "set_fan":
+        fan = action.get("fan")
+        if fan == "On":
+            st.session_state.fan_on = True
+            return "Applied: Fan → On"
+        if fan == "Auto":
+            st.session_state.fan_on = False
+            return "Applied: Fan → Auto"
+        return "Invalid fan value"
+
+    if t == "set_comfort":
+        comfort = action.get("comfort")
+        if comfort in st.session_state.setpoints:
+            st.session_state.comfort = comfort
+            return f"Applied: Comfort → {comfort}"
+        return "Invalid comfort"
+
+    if t == "set_setpoint":
+        target = action.get("target")
+        value = action.get("value")
+        comfort = action.get("comfort", st.session_state.comfort)
+
+        if target not in ["heat", "cool"]:
+            return "Invalid setpoint target"
+        try:
+            value_i = clamp(int(value))
+        except Exception:
+            return "Invalid setpoint value"
+
+        if comfort not in st.session_state.setpoints:
+            st.session_state.setpoints[comfort] = {"heat": 66, "cool": 78}
+
+        set_sp(comfort, target, value_i)
+        return f"Applied: {comfort} {target} setpoint → {value_i}"
+
+    if t == "set_location":
+        loc = (action.get("location") or "").strip()
+        if not loc:
+            return "Invalid location"
+        st.session_state.location = loc
+        st.session_state.outdoor_temp_f = None
+        st.session_state.weather_status = "Not updated"
+        return f"Applied: Location → {loc}"
+
+    return "Unknown action type"
 
 # =========================================================
 # Styling
@@ -139,7 +283,7 @@ def call_openrouter(user_text: str, model: str = "mistralai/devstral-2512:free")
 BASE_BG = "#111827"
 WHITE = "#F9FAFB"
 MUTED = "#9CA3AF"
-ACCENT = "#F97316"   # heat
+ACCENT = "#F97316"
 TEAL = "#22C55E"
 
 st.markdown(
@@ -156,7 +300,7 @@ st.markdown(
       .frame {{
         max-width: 430px;
         margin: 0 auto;
-        padding: 18px 14px 170px 14px;
+        padding: 18px 14px 190px 14px;
       }}
 
       .topbar {{
@@ -172,10 +316,16 @@ st.markdown(
       }}
 
       .statusrow {{
-        display:flex; gap: 18px; justify-content:center; align-items:center;
-        color: {MUTED}; font-size: 15px; margin-top: 10px;
+        display:flex; gap: 16px; justify-content:center; align-items:center;
+        color: {MUTED}; font-size: 14px; margin-top: 10px; flex-wrap: wrap;
       }}
-      .statusrow .chip {{ display:flex; gap: 8px; align-items:center; }}
+      .statusrow .chip {{
+        display:flex; gap: 8px; align-items:center;
+        border: 1px solid rgba(255,255,255,0.10);
+        padding: 6px 10px;
+        border-radius: 999px;
+        background: rgba(255,255,255,0.03);
+      }}
 
       .bigtemp {{
         text-align:center; font-size: 120px; line-height: 1.0; font-weight: 300;
@@ -187,25 +337,6 @@ st.markdown(
         display:flex; justify-content:center; gap: 10px; align-items:center;
       }}
 
-      /* Mode row */
-      .moderow {{
-        display:flex;
-        justify-content:center;
-        gap: 10px;
-        margin-top: 14px;
-        flex-wrap: wrap;
-      }}
-      .modepill {{
-        padding: 8px 12px;
-        border-radius: 999px;
-        border: 1px solid rgba(255,255,255,0.14);
-        background: rgba(255,255,255,0.03);
-        color: rgba(255,255,255,0.9);
-        font-size: 12px;
-        font-weight: 700;
-      }}
-
-      /* Home heat/cool pills */
       .pillRow {{
         display:flex; justify-content:center; gap: 12px; margin-top: 16px;
       }}
@@ -229,7 +360,6 @@ st.markdown(
         background: rgba(96,165,250,0.06);
       }}
 
-      /* Dial */
       .dialWrap {{
         position: relative; height: 430px;
         display:flex; align-items:center; justify-content:center;
@@ -299,13 +429,12 @@ st.markdown(
         font-size: 13px; line-height: 1.3;
         margin-bottom: 8px;
       }}
-
-      .assistantInput .stTextInput input {{
-        height: 38px !important;
-        border-radius: 14px !important;
-        background: rgba(255,255,255,0.04) !important;
-        border: 1px solid rgba(255,255,255,0.10) !important;
-        color: {WHITE} !important;
+      .pending {{
+        margin-top: 8px;
+        border-top: 1px solid rgba(255,255,255,0.08);
+        padding-top: 8px;
+        color: rgba(255,255,255,0.82);
+        font-size: 12px;
       }}
 
       div.stButton > button {{
@@ -334,47 +463,6 @@ def topbar(title: str, left_symbol="👤", right_symbol="⚙"):
         """,
         unsafe_allow_html=True,
     )
-
-def assistant_bar():
-    st.markdown('<div class="assistantbar"><div class="inner">', unsafe_allow_html=True)
-    st.markdown(
-        f"""
-        <div class="assistantbubble">
-          <div class="reply">{st.session_state.assistant_last_reply}</div>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-
-    with st.form("assistant_form", clear_on_submit=True):
-        st.markdown('<div class="assistantInput">', unsafe_allow_html=True)
-        user_msg = st.text_input(
-            "Assistant",
-            key="assistant_input",
-            placeholder="Ask the assistant… (e.g., 'Switch to Auto' or 'Set Sleep heat to 65')",
-            label_visibility="collapsed",
-        )
-        st.markdown("</div>", unsafe_allow_html=True)
-        sent = st.form_submit_button("Send")
-
-    st.markdown("</div></div>", unsafe_allow_html=True)
-
-    if sent:
-        user_msg = (user_msg or "").strip()
-        if not user_msg:
-            return
-
-        st.session_state.assistant_messages.append({"role": "user", "content": user_msg})
-        try:
-            with st.spinner("Thinking…"):
-                reply = call_openrouter(user_msg)
-        except Exception as e:
-            st.session_state.assistant_last_reply = f"LLM error: {e}"
-            st.rerun()
-
-        st.session_state.assistant_messages.append({"role": "assistant", "content": reply})
-        st.session_state.assistant_last_reply = reply
-        st.rerun()
 
 def bottom_nav():
     c1, c2, c3 = st.columns(3)
@@ -411,6 +499,98 @@ def bottom_nav():
         unsafe_allow_html=True,
     )
 
+def describe_action(action: Dict[str, Any]) -> str:
+    t = action.get("type")
+    if t == "set_hvac_mode":
+        return f"Proposed change: HVAC mode → **{action.get('mode')}**"
+    if t == "set_fan":
+        return f"Proposed change: Fan → **{action.get('fan')}**"
+    if t == "set_comfort":
+        return f"Proposed change: Comfort → **{action.get('comfort')}**"
+    if t == "set_setpoint":
+        comfort = action.get("comfort", st.session_state.comfort)
+        return f"Proposed change: **{comfort}** {action.get('target')} setpoint → **{action.get('value')}**"
+    if t == "set_location":
+        return f"Proposed change: Location → **{action.get('location')}**"
+    return "Proposed change: (unknown)"
+
+def assistant_bar():
+    st.markdown('<div class="assistantbar"><div class="inner">', unsafe_allow_html=True)
+
+    # Show last reply + pending action UI
+    pending = st.session_state.pending_action
+    pending_html = ""
+    if pending:
+        pending_html = f"""
+        <div class="pending">
+          {describe_action(pending)}<br/>
+          <span style="opacity:0.85">{st.session_state.pending_explainer}</span>
+        </div>
+        """
+
+    st.markdown(
+        f"""
+        <div class="assistantbubble">
+          <div class="reply">{st.session_state.assistant_last_reply}</div>
+          {pending_html}
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    # Confirm/cancel buttons if pending action exists
+    if pending:
+        c_ok, c_no = st.columns(2)
+        with c_ok:
+            if st.button("Confirm", use_container_width=True):
+                status = apply_action(st.session_state.pending_action)
+                st.session_state.pending_action = None
+                st.session_state.pending_explainer = ""
+                st.session_state.assistant_last_reply = f"{status}. UI updated."
+                st.rerun()
+        with c_no:
+            if st.button("Cancel", use_container_width=True):
+                st.session_state.pending_action = None
+                st.session_state.pending_explainer = ""
+                st.session_state.assistant_last_reply = "Cancelled. No changes made."
+                st.rerun()
+
+    with st.form("assistant_form", clear_on_submit=True):
+        user_msg = st.text_input(
+            "Assistant",
+            key="assistant_input",
+            placeholder="Ask… e.g. 'Switch to Auto', 'Fan On', 'Set Sleep cool to 78', 'Set location to Monterrey'",
+            label_visibility="collapsed",
+        )
+        sent = st.form_submit_button("Send")
+
+    st.markdown("</div></div>", unsafe_allow_html=True)
+
+    if sent:
+        user_msg = (user_msg or "").strip()
+        if not user_msg:
+            return
+
+        st.session_state.assistant_messages.append({"role": "user", "content": user_msg})
+        try:
+            with st.spinner("Thinking…"):
+                reply_text, action = call_openrouter(user_msg)
+        except Exception as e:
+            st.session_state.assistant_last_reply = f"LLM error: {e}"
+            st.rerun()
+
+        # Store assistant visible reply
+        st.session_state.assistant_messages.append({"role": "assistant", "content": reply_text})
+        st.session_state.assistant_last_reply = reply_text
+
+        # If an action was proposed, store it as pending (requires confirm)
+        if action:
+            st.session_state.pending_action = action
+            # Keep explainer short; you can also have model write it, but this works safely.
+            st.session_state.pending_explainer = "Confirm to apply. This may affect comfort and energy use."
+
+        st.rerun()
+
 # =========================================================
 # Views
 # =========================================================
@@ -422,12 +602,18 @@ if st.session_state.view == "Home":
     heat_sp = get_sp(st.session_state.comfort, "heat")
     cool_sp = get_sp(st.session_state.comfort, "cool")
 
-    # status chips
+    # Outdoor chip
+    outdoor_chip = "Outdoor: —"
+    if st.session_state.outdoor_temp_f is not None:
+        outdoor_chip = f"Outdoor: {st.session_state.outdoor_temp_f:.0f}°F"
+
     st.markdown(
         f"""
         <div class="statusrow">
           <div class="chip">{ico('💧')} <b style="color:{WHITE}">{st.session_state.humidity}%</b></div>
           <div class="chip">{ico('🌬')} <b style="color:{WHITE}">{st.session_state.air_quality}</b></div>
+          <div class="chip">{ico('📍')} <b style="color:{WHITE}">{st.session_state.location}</b></div>
+          <div class="chip">{ico('🌡️')} <b style="color:{WHITE}">{outdoor_chip}</b></div>
         </div>
         """,
         unsafe_allow_html=True,
@@ -443,33 +629,18 @@ if st.session_state.view == "Home":
         unsafe_allow_html=True,
     )
 
-    # NEW: Mode selectors (built-in, not fake)
-    st.markdown(
-        f"""
-        <div class="moderow">
-          <div class="modepill">{ico('🧠')} Mode: <b>{st.session_state.hvac_mode}</b></div>
-          <div class="modepill">{ico('🌀')} Fan: <b>{st.session_state.fan_mode}</b></div>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-
-    # Simple selectors (real controls)
-    colM, colF = st.columns(2)
-    with colM:
+    # Mode + fan controls (this is what the LLM will change AFTER you confirm)
+    c1, c2 = st.columns([1.4, 1.0])
+    with c1:
+        hvac_modes = ["Off", "Heat", "Cool", "Auto", "Aux"]
         st.session_state.hvac_mode = st.selectbox(
             "System Mode",
-            ["Heat", "Cool", "Auto", "Off"],
-            index=["Heat", "Cool", "Auto", "Off"].index(st.session_state.hvac_mode),
+            hvac_modes,
+            index=hvac_modes.index(st.session_state.hvac_mode),
             label_visibility="collapsed",
         )
-    with colF:
-        st.session_state.fan_mode = st.selectbox(
-            "Fan Mode",
-            ["Auto", "On"],
-            index=["Auto", "On"].index(st.session_state.fan_mode),
-            label_visibility="collapsed",
-        )
+    with c2:
+        st.session_state.fan_on = st.toggle("Fan On", value=st.session_state.fan_on)
 
     # Heat / Cool setpoint pills
     st.markdown(
@@ -499,6 +670,22 @@ if st.session_state.view == "Home":
             st.session_state.dial_target = "cool"
             st.session_state.view = "Dial"
             st.rerun()
+
+    st.markdown("<div style='height:10px'></div>", unsafe_allow_html=True)
+
+    # Location + outdoor temperature update
+    colL, colW = st.columns([1.4, 1.0])
+    with colL:
+        st.session_state.location = st.text_input("Location", value=st.session_state.location, label_visibility="collapsed")
+    with colW:
+        if st.button("Update outdoor temp", use_container_width=True):
+            temp_f, status = fetch_openmeteo_outdoor_temp_f(st.session_state.location)
+            st.session_state.outdoor_temp_f = temp_f
+            st.session_state.weather_status = status
+            st.session_state.assistant_last_reply = status if temp_f is None else f"{status}. Outdoor now {temp_f:.0f}°F."
+            st.rerun()
+
+    st.caption(st.session_state.weather_status)
 
 elif st.session_state.view == "Dial":
     target = st.session_state.dial_target
@@ -593,6 +780,5 @@ elif st.session_state.view == "Comfort":
 
 st.markdown("</div>", unsafe_allow_html=True)
 
-# Fixed assistant bar + bottom nav
 assistant_bar()
 bottom_nav()
