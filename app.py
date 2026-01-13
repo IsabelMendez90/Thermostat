@@ -423,6 +423,54 @@ def bottom_nav():
         unsafe_allow_html=True,
     )
 
+from openai import OpenAI
+
+def get_openrouter_client() -> OpenAI:
+    api_key = st.secrets.get("OPENROUTER_API_KEY", "")
+    if not api_key:
+        st.error("Missing OPENROUTER_API_KEY in Streamlit secrets.")
+        st.stop()
+    return OpenAI(base_url="https://openrouter.ai/api/v1", api_key=api_key)
+
+def call_openrouter(conversation_messages, model="mistralai/devstral-2512:free") -> str:
+    """
+    conversation_messages: list of dicts like:
+      [{"role":"user","content":"..."}, {"role":"assistant","content":"..."}]
+    Returns: assistant text
+    """
+    client = get_openrouter_client()
+
+    site_url = st.secrets.get("YOUR_SITE_URL", "")
+    site_name = st.secrets.get("YOUR_SITE_NAME", "Streamlit Ecobee")
+
+    # Keep it short (prevents token bloat + keeps UI snappy)
+    recent = conversation_messages[-10:]
+
+    # Add a system instruction (ecobee assistant vibe)
+    messages = [
+        {
+            "role": "system",
+            "content": (
+                "You are an ecobee-style thermostat assistant. "
+                "Be concise, practical, and friendly. "
+                "If the user asks to change setpoints, propose exact heat/cool values."
+            ),
+        },
+        *recent,
+    ]
+
+    completion = client.chat.completions.create(
+        model=model,
+        messages=messages,
+        extra_headers={
+            "HTTP-Referer": site_url,
+            "X-Title": site_name,
+        },
+    )
+
+    return completion.choices[0].message.content.strip()
+
+
 def assistant_bar():
     # init once (safe)
     if "assistant_messages" not in st.session_state:
