@@ -424,43 +424,37 @@ def bottom_nav():
     )
 
 def assistant_bar():
-    last_reply = "Message me: “Set Sleep heat to 66” or “What are my setpoints?”"
-    for m in reversed(st.session_state.assistant_msgs):
-        if m["role"] == "assistant":
-            last_reply = m["content"]
-            break
+    # init once (safe)
+    if "assistant_messages" not in st.session_state:
+        st.session_state.assistant_messages = []  # list of dicts {role, content}
 
-    st.markdown(
-        """
-        <div class="assistantbar">
-          <div class="inner">
-            <div class="assistantbubble">
-        """,
-        unsafe_allow_html=True,
-    )
+    st.markdown('<div class="assistantbar">', unsafe_allow_html=True)
 
-    st.markdown(f"<div class='reply'>{last_reply}</div>", unsafe_allow_html=True)
-
-    c1, c2 = st.columns([6, 1])
-    with c1:
-        st.markdown("<div class='assistantInput'>", unsafe_allow_html=True)
-        user_text = st.text_input(
-            "Assistant input",
-            placeholder="Message the thermostat…",
-            key="assistant_input",
+    with st.form("assistant_form", clear_on_submit=True):
+        user_msg = st.text_input(
+            "Assistant",
+            key="assistant_input",                # OK: owned by the widget
+            placeholder="Ask the assistant…",
             label_visibility="collapsed",
         )
-        st.markdown("</div>", unsafe_allow_html=True)
-    with c2:
-        send = st.button("➤", key="assistant_send")
+        sent = st.form_submit_button("Send")
 
-    if send and user_text.strip():
-        st.session_state.assistant_msgs.append({"role": "user", "content": user_text.strip()})
-        with st.spinner("Thinking…"):
-            reply = llm_reply(user_text.strip())
-        st.session_state.assistant_msgs.append({"role": "assistant", "content": reply})
-        st.session_state.assistant_input = ""
+    st.markdown("</div>", unsafe_allow_html=True)
+
+    if sent:
+        user_msg = (user_msg or "").strip()
+        if not user_msg:
+            return
+
+        # store user message
+        st.session_state.assistant_messages.append({"role": "user", "content": user_msg})
+
+        # call OpenRouter here (example)
+        reply = call_openrouter(st.session_state.assistant_messages)
+        st.session_state.assistant_messages.append({"role": "assistant", "content": reply})
+
         st.rerun()
+
 
     st.markdown(
         "<div class='hint'>Tip: The assistant has access to current mode, comfort, and heat/cool setpoints.</div>",
