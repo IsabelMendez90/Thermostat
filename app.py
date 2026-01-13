@@ -50,31 +50,14 @@ def comfort_icon(name: str) -> str:
     }.get(name, "✨")
 
 # =========================================================
-# Query-param router (HTML links can switch views cleanly)
-# =========================================================
-def _get_qp(name: str):
-    # Streamlit versions differ; support both
-    try:
-        v = st.query_params.get(name, None)
-        if isinstance(v, list):
-            v = v[0] if v else None
-        return v
-    except Exception:
-        return st.experimental_get_query_params().get(name, [None])[0]
-
-qp_view = _get_qp("view")
-if qp_view in {"Home", "Dial", "Reports", "Menu", "Comfort"}:
-    st.session_state.view = qp_view
-
-# =========================================================
 # Styling (ecobee-ish)
 # =========================================================
-BASE_BG = "#111827"      # deep navy
-CARD_BG = "#1F2937"      # slate
-MUTED = "#9CA3AF"        # gray text
+BASE_BG = "#111827"
+CARD_BG = "#1F2937"
+MUTED = "#9CA3AF"
 WHITE = "#F9FAFB"
-ACCENT = "#F97316"       # orange
-TEAL = "#22C55E"         # ecobee-ish green
+ACCENT = "#F97316"
+TEAL = "#22C55E"
 
 st.markdown(
     f"""
@@ -94,7 +77,7 @@ st.markdown(
       .frame {{
         max-width: 430px;
         margin: 0 auto;
-        padding: 18px 14px 92px 14px; /* leave room for bottom nav */
+        padding: 18px 14px 92px 14px;
       }}
 
       /* Top bar */
@@ -145,28 +128,35 @@ st.markdown(
         align-items:center;
       }}
 
-      /* Clickable setpoint pill as an <a> link (NO Streamlit button) */
-      .pilllink {{
-        width: 140px;
-        margin: 18px auto 0 auto;
-        display: block;
-        text-align: center;
-        border-radius: 999px;
-        border: 2px solid {ACCENT};
-        background: rgba(249,115,22,0.06);
-        color: {ACCENT};
-        font-weight: 800;
-        letter-spacing: 0.4px;
-        padding: 10px 0;
-        text-decoration: none;
-        cursor: pointer;
-        font-size: 20px;
-      }}
-      .pilllink:hover {{
-        filter: brightness(1.08);
+      /* ---- IMPORTANT: Global button styling FIRST ---- */
+      div.stButton > button {{
+        border-radius: 999px !important;
+        border: 1px solid rgba(255,255,255,0.12) !important;
+        background: rgba(255,255,255,0.03) !important;
+        color: {WHITE} !important;
+        padding: 10px 14px !important;
       }}
 
-      /* Card list (menu / comfort settings) */
+      /* Setpoint pill wrapper */
+      .pillwrap {{
+        width: 140px;
+        margin: 18px auto 0 auto;
+      }}
+
+      /* ---- Pill styling AFTER global so it wins ---- */
+      .pillwrap div.stButton > button {{
+        width: 140px !important;
+        border-radius: 999px !important;
+        border: 2px solid {ACCENT} !important;
+        background: rgba(249,115,22,0.06) !important;
+        color: {ACCENT} !important;
+        font-weight: 800 !important;
+        letter-spacing: 0.4px !important;
+        padding: 10px 0 !important;
+        font-size: 20px !important;
+      }}
+
+      /* Card list */
       .card {{
         background: rgba(31,41,55,0.9);
         border: 1px solid rgba(255,255,255,0.08);
@@ -235,7 +225,7 @@ st.markdown(
         padding: 0 !important;
       }}
 
-      /* Bottom nav (visual bar) */
+      /* Bottom nav */
       .bottomnav {{
         position: fixed;
         left: 0; right: 0; bottom: 0;
@@ -282,7 +272,7 @@ st.markdown(
 )
 
 # =========================================================
-# Tiny inline "icons"
+# UI helpers
 # =========================================================
 def ico(symbol: str) -> str:
     return f"<span style='font-size:16px; opacity:0.95'>{symbol}</span>"
@@ -300,18 +290,17 @@ def topbar(title: str, left_symbol="👤", right_symbol="⚙", left_hint="User",
     )
 
 def bottom_nav():
-    # Real navigation actions (keep your Streamlit buttons here)
     c1, c2, c3 = st.columns(3)
     with c1:
-        if st.button("Home", use_container_width=True):
+        if st.button("Home", use_container_width=True, key="nav_home"):
             st.session_state.view = "Home"
             st.rerun()
     with c2:
-        if st.button("Reports", use_container_width=True):
+        if st.button("Reports", use_container_width=True, key="nav_reports"):
             st.session_state.view = "Reports"
             st.rerun()
     with c3:
-        if st.button("Menu", use_container_width=True):
+        if st.button("Menu", use_container_width=True, key="nav_menu"):
             st.session_state.view = "Menu"
             st.rerun()
 
@@ -362,8 +351,12 @@ if st.session_state.view == "Home":
         unsafe_allow_html=True,
     )
 
-    # ✅ The pill itself is the tap target (no extra Streamlit button anywhere)
-    st.markdown(f'<a class="pilllink" href="?view=Dial">{sp}</a>', unsafe_allow_html=True)
+    # ✅ Natural reactive pill: the pill IS the button, centered, no new window, no link.
+    st.markdown('<div class="pillwrap">', unsafe_allow_html=True)
+    if st.button(f"{sp}", key="open_dial_pill", help="Tap to adjust setpoint"):
+        st.session_state.view = "Dial"
+        st.rerun()
+    st.markdown("</div>", unsafe_allow_html=True)
 
     st.markdown("<div style='height:14px'></div>", unsafe_allow_html=True)
     st.caption("Tip: tap the orange setpoint to adjust it (Dial).")
@@ -371,8 +364,9 @@ if st.session_state.view == "Home":
 elif st.session_state.view == "Dial":
     topbar("", left_symbol="←", right_symbol="")
 
-    # Optional: real back link (feels like an app)
-    st.markdown('<div style="text-align:left; margin:-6px 0 8px 2px;"><a href="?view=Home" style="color:rgba(255,255,255,0.7); text-decoration:none;">← Back</a></div>', unsafe_allow_html=True)
+    if st.button("Back", key="dial_back"):
+        st.session_state.view = "Home"
+        st.rerun()
 
     sp = current_setpoint()
 
@@ -412,7 +406,6 @@ elif st.session_state.view == "Dial":
 
 elif st.session_state.view == "Reports":
     topbar("Reports", left_symbol="＋", right_symbol="👤", left_hint="Add", right_hint="Profile")
-
     st.markdown(
         f"""
         <div class="card">
@@ -427,14 +420,12 @@ elif st.session_state.view == "Reports":
         """,
         unsafe_allow_html=True,
     )
-
     st.markdown("<div style='height:12px'></div>", unsafe_allow_html=True)
-    st.info("Aquí puedes luego conectar tus métricas reales (runtime, setpoints, clusters, etc.). Por ahora es placeholder 😄")
+    st.info("Placeholder for runtime/setpoint/cluster metrics.")
 
 elif st.session_state.view == "Menu":
     topbar("Main Menu", left_symbol="✕", right_symbol="")
-
-    st.text_input("Search thermostat settings", placeholder="Search thermostat settings")
+    st.text_input("Search thermostat settings", placeholder="Search thermostat settings", key="menu_search")
 
     st.markdown(
         f"""
@@ -443,27 +434,22 @@ elif st.session_state.view == "Menu":
             <div class="left">{ico('e')} <div><div><b>eco+</b></div><div class="sub">Enabled</div></div></div>
             <div class="chev">›</div>
           </div>
-
           <div class="row">
             <div class="left">{ico('🛠')} <div><div><b>System</b></div><div class="sub">HVAC Mode: {st.session_state.hvac_mode}</div></div></div>
             <div class="chev">›</div>
           </div>
-
           <div class="row">
             <div class="left">{ico('🌬')} <div><div><b>Air Quality</b></div><div class="sub">{st.session_state.air_quality}</div></div></div>
             <div class="chev">›</div>
           </div>
-
           <div class="row">
             <div class="left">{ico('📡')} <div><div><b>Sensors</b></div><div class="sub">2 Sensors</div></div></div>
             <div class="chev">›</div>
           </div>
-
           <div class="row">
             <div class="left">{ico('🗓')} <div><div><b>Schedule</b></div><div class="sub">Weekly</div></div></div>
             <div class="chev">›</div>
           </div>
-
           <div class="row">
             <div class="left">{ico('🛋')} <div><div><b>Comfort Settings</b></div><div class="sub">Home / Away / Sleep / Morning</div></div></div>
             <div class="chev">›</div>
@@ -474,7 +460,7 @@ elif st.session_state.view == "Menu":
     )
 
     st.markdown("<div style='height:12px'></div>", unsafe_allow_html=True)
-    if st.button("Open Comfort Settings"):
+    if st.button("Open Comfort Settings", key="open_comfort"):
         st.session_state.view = "Comfort"
         st.rerun()
 
@@ -508,9 +494,8 @@ elif st.session_state.view == "Comfort":
         "Active comfort",
         list(st.session_state.setpoints.keys()),
         index=list(st.session_state.setpoints.keys()).index(st.session_state.comfort),
+        key="active_comfort",
     )
 
 st.markdown("</div>", unsafe_allow_html=True)
-
-# Bottom nav
 bottom_nav()
