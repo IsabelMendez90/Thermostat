@@ -1,5 +1,6 @@
 import json
 import re
+from datetime import datetime, timedelta
 from typing import Any, Dict, Optional, Tuple
 
 import requests
@@ -50,6 +51,7 @@ def init_state():
     ss.setdefault("location", "Berkeley, CA")
     ss.setdefault("outdoor_temp_f", None)  # float or None
     ss.setdefault("weather_status", "Not updated")
+    ss.setdefault("outdoor_last_update", None)  # datetime or None
 
 init_state()
 
@@ -85,13 +87,12 @@ def fan_label() -> str:
 # =========================================================
 # Weather via Open-Meteo (free, no key)
 # =========================================================
-def f_from_c(c: float) -> float:
-    return c * 9.0 / 5.0 + 32.0
-
-def fetch_openmeteo_outdoor_temp_f(location_text: str) -> Tuple[Optional[float], str]:
+def fetch_openmeteo_current(location_text: str) -> Tuple[Optional[Dict[str, Any]], str]:
     """
-    Uses Open-Meteo geocoding + current weather.
-    Returns (temp_f or None, status message).
+    Open-Meteo geocoding + current weather.
+    Returns (data_or_none, status_message)
+
+    data includes: temp_f, wind_mph, weather_code, name, lat, lon
     """
     try:
         geo = requests.get(
@@ -110,7 +111,13 @@ def fetch_openmeteo_outdoor_temp_f(location_text: str) -> Tuple[Optional[float],
 
         wx = requests.get(
             "https://api.open-meteo.com/v1/forecast",
-            params={"latitude": lat, "longitude": lon, "current_weather": True, "temperature_unit": "celsius"},
+            params={
+                "latitude": lat,
+                "longitude": lon,
+                "current_weather": True,
+                "temperature_unit": "fahrenheit",
+                "wind_speed_unit": "mph",
+            },
             timeout=10,
         )
         wx.raise_for_status()
@@ -119,10 +126,36 @@ def fetch_openmeteo_outdoor_temp_f(location_text: str) -> Tuple[Optional[float],
         if "temperature" not in cw:
             return None, f"Weather unavailable for {nice_name}"
 
-        temp_f = f_from_c(float(cw["temperature"]))
-        return temp_f, f"Updated from Open-Meteo for {nice_name}"
+        data = {
+            "temp_f": float(cw["temperature"]),
+            "wind_mph": float(cw.get("windspeed", 0.0)),
+            "weather_code": int(cw.get("weathercode", -1)),
+            "lat": float(lat),
+            "lon": float(lon),
+            "name": nice_name,
+        }
+        return data, f"Updated from Open-Meteo for {nice_name}"
     except Exception as e:
         return None, f"Weather error: {e}"
+
+def maybe_refresh_outdoor(minutes: int = 15):
+    """
+    Auto-refresh outdoor temp if stale.
+    Keeps API calls under control.
+    """
+    last = st.session_state.outdoor_last_update
+    if last and isinstance(last, datetime):
+        if (datetime.utcnow() - last) < timedelta(minutes=minutes):
+            return
+
+    data, status = fetch_openmeteo_current(st.session_state.location)
+    st.session_state.weather_status = status
+    if data:
+        st.session_state.outdoor_temp_f = data["temp_f"]
+        st.session_state.outdoor_last_update = datetime.utcnow()
+
+# Optional: uncomment to auto-refresh while app runs
+# maybe_refresh_outdoor(minutes=15)
 
 # =========================================================
 # OpenRouter client
@@ -168,7 +201,6 @@ def parse_action_from_text(text: str) -> Tuple[Optional[Dict[str, Any]], str]:
     try:
         action = json.loads(raw)
     except Exception:
-        # If the model outputs broken JSON, treat as non-action
         return None, text.strip()
 
     cleaned = ACTION_TAG_RE.sub("", text).strip()
@@ -197,8 +229,9 @@ def call_openrouter(user_text: str, model: str = "mistralai/devstral-2512:free")
         "- set_location: {\"type\":\"set_location\",\"location\":\"text\"}\n\n"
         "Important:\n"
         "- Never claim the change has already happened. Only propose it.\n"
-        "- Mention comfort/energy tradeoffs briefly before proposing the action.\n"
-        "- If the user asks for climate reasoning, use location and outdoor_temp if available.\n"
+        "- Mention comfort/energy tradeoffs briefly BEFORE proposing the action.\n"
+        "- If user asks to switch mode/fan/etc, propose it as an action.\n"
+        "- If user asks for climate reasoning, use location and outdoor_temp if available.\n"
     )
 
     messages = [
@@ -260,9 +293,7 @@ def apply_action(action: Dict[str, Any]) -> str:
         except Exception:
             return "Invalid setpoint value"
 
-        if comfort not in st.session_state.setpoints:
-            st.session_state.setpoints[comfort] = {"heat": 66, "cool": 78}
-
+        st.session_state.setpoints.setdefault(comfort, {"heat": 66, "cool": 78})
         set_sp(comfort, target, value_i)
         return f"Applied: {comfort} {target} setpoint → {value_i}"
 
@@ -273,6 +304,7 @@ def apply_action(action: Dict[str, Any]) -> str:
         st.session_state.location = loc
         st.session_state.outdoor_temp_f = None
         st.session_state.weather_status = "Not updated"
+        st.session_state.outdoor_last_update = None
         return f"Applied: Location → {loc}"
 
     return "Unknown action type"
@@ -300,7 +332,7 @@ st.markdown(
       .frame {{
         max-width: 430px;
         margin: 0 auto;
-        padding: 18px 14px 190px 14px;
+        padding: 18px 14px 210px 14px;
       }}
 
       .topbar {{
@@ -316,7 +348,7 @@ st.markdown(
       }}
 
       .statusrow {{
-        display:flex; gap: 16px; justify-content:center; align-items:center;
+        display:flex; gap: 10px; justify-content:center; align-items:center;
         color: {MUTED}; font-size: 14px; margin-top: 10px; flex-wrap: wrap;
       }}
       .statusrow .chip {{
@@ -388,26 +420,6 @@ st.markdown(
         color: {WHITE} !important; font-size: 28px !important; font-weight: 800 !important; padding: 0 !important;
       }}
 
-      /* Bottom nav */
-      .bottomnav {{
-        position: fixed; left: 0; right: 0; bottom: 0;
-        padding: 10px 0 14px 0;
-        background: rgba(17,24,39,0.85);
-        backdrop-filter: blur(10px);
-        border-top: 1px solid rgba(255,255,255,0.08);
-      }}
-      .bottomnav .inner {{
-        max-width: 430px; margin: 0 auto;
-        display:flex; justify-content:space-around; align-items:center; padding: 0 20px;
-      }}
-      .navitem {{
-        display:flex; flex-direction:column; align-items:center; gap: 6px;
-        color: {MUTED}; font-size: 12px;
-      }}
-      .navdot {{ width: 10px; height: 10px; border-radius: 999px; background: rgba(255,255,255,0.12); }}
-      .navitem.active {{ color: {TEAL}; }}
-      .navitem.active .navdot {{ background: {TEAL}; }}
-
       /* Assistant bar */
       .assistantbar {{
         position: fixed; left: 0; right: 0; bottom: 86px;
@@ -436,6 +448,26 @@ st.markdown(
         color: rgba(255,255,255,0.82);
         font-size: 12px;
       }}
+
+      /* Bottom nav */
+      .bottomnav {{
+        position: fixed; left: 0; right: 0; bottom: 0;
+        padding: 10px 0 14px 0;
+        background: rgba(17,24,39,0.85);
+        backdrop-filter: blur(10px);
+        border-top: 1px solid rgba(255,255,255,0.08);
+      }}
+      .bottomnav .inner {{
+        max-width: 430px; margin: 0 auto;
+        display:flex; justify-content:space-around; align-items:center; padding: 0 20px;
+      }}
+      .navitem {{
+        display:flex; flex-direction:column; align-items:center; gap: 6px;
+        color: {MUTED}; font-size: 12px;
+      }}
+      .navdot {{ width: 10px; height: 10px; border-radius: 999px; background: rgba(255,255,255,0.12); }}
+      .navitem.active {{ color: {TEAL}; }}
+      .navitem.active .navdot {{ background: {TEAL}; }}
 
       div.stButton > button {{
         border-radius: 999px !important;
@@ -517,7 +549,6 @@ def describe_action(action: Dict[str, Any]) -> str:
 def assistant_bar():
     st.markdown('<div class="assistantbar"><div class="inner">', unsafe_allow_html=True)
 
-    # Show last reply + pending action UI
     pending = st.session_state.pending_action
     pending_html = ""
     if pending:
@@ -538,7 +569,6 @@ def assistant_bar():
         unsafe_allow_html=True,
     )
 
-    # Confirm/cancel buttons if pending action exists
     if pending:
         c_ok, c_no = st.columns(2)
         with c_ok:
@@ -579,14 +609,11 @@ def assistant_bar():
             st.session_state.assistant_last_reply = f"LLM error: {e}"
             st.rerun()
 
-        # Store assistant visible reply
         st.session_state.assistant_messages.append({"role": "assistant", "content": reply_text})
         st.session_state.assistant_last_reply = reply_text
 
-        # If an action was proposed, store it as pending (requires confirm)
         if action:
             st.session_state.pending_action = action
-            # Keep explainer short; you can also have model write it, but this works safely.
             st.session_state.pending_explainer = "Confirm to apply. This may affect comfort and energy use."
 
         st.rerun()
@@ -602,7 +629,6 @@ if st.session_state.view == "Home":
     heat_sp = get_sp(st.session_state.comfort, "heat")
     cool_sp = get_sp(st.session_state.comfort, "cool")
 
-    # Outdoor chip
     outdoor_chip = "Outdoor: —"
     if st.session_state.outdoor_temp_f is not None:
         outdoor_chip = f"Outdoor: {st.session_state.outdoor_temp_f:.0f}°F"
@@ -614,6 +640,8 @@ if st.session_state.view == "Home":
           <div class="chip">{ico('🌬')} <b style="color:{WHITE}">{st.session_state.air_quality}</b></div>
           <div class="chip">{ico('📍')} <b style="color:{WHITE}">{st.session_state.location}</b></div>
           <div class="chip">{ico('🌡️')} <b style="color:{WHITE}">{outdoor_chip}</b></div>
+          <div class="chip">{ico('🌀')} <b style="color:{WHITE}">Fan {fan_label()}</b></div>
+          <div class="chip">{ico('🧠')} <b style="color:{WHITE}">{st.session_state.hvac_mode}</b></div>
         </div>
         """,
         unsafe_allow_html=True,
@@ -629,7 +657,7 @@ if st.session_state.view == "Home":
         unsafe_allow_html=True,
     )
 
-    # Mode + fan controls (this is what the LLM will change AFTER you confirm)
+    # Mode + fan controls (LLM can propose changes; user confirms)
     c1, c2 = st.columns([1.4, 1.0])
     with c1:
         hvac_modes = ["Off", "Heat", "Cool", "Auto", "Aux"]
@@ -637,12 +665,10 @@ if st.session_state.view == "Home":
             "System Mode",
             hvac_modes,
             index=hvac_modes.index(st.session_state.hvac_mode),
-            label_visibility="collapsed",
         )
     with c2:
         st.session_state.fan_on = st.toggle("Fan On", value=st.session_state.fan_on)
 
-    # Heat / Cool setpoint pills
     st.markdown(
         f"""
         <div class="pillRow">
@@ -673,16 +699,20 @@ if st.session_state.view == "Home":
 
     st.markdown("<div style='height:10px'></div>", unsafe_allow_html=True)
 
-    # Location + outdoor temperature update
     colL, colW = st.columns([1.4, 1.0])
     with colL:
-        st.session_state.location = st.text_input("Location", value=st.session_state.location, label_visibility="collapsed")
+        st.session_state.location = st.text_input("Location", value=st.session_state.location)
     with colW:
-        if st.button("Update outdoor temp", use_container_width=True):
-            temp_f, status = fetch_openmeteo_outdoor_temp_f(st.session_state.location)
-            st.session_state.outdoor_temp_f = temp_f
+        if st.button("Update outdoor", use_container_width=True):
+            data, status = fetch_openmeteo_current(st.session_state.location)
             st.session_state.weather_status = status
-            st.session_state.assistant_last_reply = status if temp_f is None else f"{status}. Outdoor now {temp_f:.0f}°F."
+            if data:
+                st.session_state.outdoor_temp_f = data["temp_f"]
+                st.session_state.outdoor_last_update = datetime.utcnow()
+                st.session_state.assistant_last_reply = f"{status}. Outdoor now {data['temp_f']:.0f}°F."
+            else:
+                st.session_state.outdoor_temp_f = None
+                st.session_state.assistant_last_reply = status
             st.rerun()
 
     st.caption(st.session_state.weather_status)
@@ -740,6 +770,7 @@ elif st.session_state.view == "Menu":
 
 elif st.session_state.view == "Comfort":
     topbar("Comfort Settings", left_symbol="←", right_symbol="＋")
+
     st.markdown(
         """
         <div style="color:rgba(255,255,255,0.7); font-size:15px; line-height:1.4; margin-bottom:14px;">
