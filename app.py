@@ -24,7 +24,7 @@ if "hvac_mode" not in st.session_state:
 if "comfort" not in st.session_state:
     st.session_state.comfort = "Away"  # Home / Away / Sleep / Morning
 
-# Two setpoints per comfort: Heat + Cool (like ecobee)
+# Two setpoints per comfort: Heat + Cool
 if "setpoints" not in st.session_state:
     st.session_state.setpoints = {
         "Home": {"heat": 68, "cool": 76},
@@ -37,20 +37,18 @@ if "setpoints" not in st.session_state:
 if "dial_target" not in st.session_state:
     st.session_state.dial_target = "heat"  # "heat" or "cool"
 
-# LLM chat memory
-if "assistant_msgs" not in st.session_state:
-    st.session_state.assistant_msgs = []
+# LLM messages
+if "assistant_messages" not in st.session_state:
+    st.session_state.assistant_messages = []  # [{"role":"user|assistant","content":"..."}]
+
+if "assistant_last_reply" not in st.session_state:
+    st.session_state.assistant_last_reply = "Ask me anything about your thermostat."
 
 # =========================================================
 # Convenience
 # =========================================================
 def comfort_icon(name: str) -> str:
-    return {
-        "Home": "🏠",
-        "Away": "🚶",
-        "Sleep": "🌙",
-        "Morning": "☀️",
-    }.get(name, "✨")
+    return {"Home": "🏠", "Away": "🚶", "Sleep": "🌙", "Morning": "☀️"}.get(name, "✨")
 
 def clamp(v: int, lo: int = 45, hi: int = 90) -> int:
     return max(lo, min(hi, int(v)))
@@ -76,53 +74,50 @@ def ico(symbol: str) -> str:
 # =========================================================
 # OpenRouter (LLM)
 # =========================================================
-def get_or_client() -> OpenAI:
+def get_openrouter_client() -> OpenAI:
     api_key = st.secrets.get("OPENROUTER_API_KEY", "")
     if not api_key:
         st.error("Missing OPENROUTER_API_KEY in Streamlit secrets.")
         st.stop()
     return OpenAI(base_url="https://openrouter.ai/api/v1", api_key=api_key)
 
-def llm_reply(user_text: str) -> str:
-    client = get_or_client()
+def call_openrouter(user_text: str, model: str = "mistralai/devstral-2512:free") -> str:
+    client = get_openrouter_client()
+
     site_url = st.secrets.get("YOUR_SITE_URL", "")
     site_name = st.secrets.get("YOUR_SITE_NAME", "Streamlit Ecobee")
 
+    # Provide compact state context (so it acts “inside” your thermostat)
     state = {
-        "view": st.session_state.get("view"),
-        "indoor_temp": st.session_state.get("indoor_temp"),
-        "humidity": st.session_state.get("humidity"),
-        "air_quality": st.session_state.get("air_quality"),
-        "hvac_mode": st.session_state.get("hvac_mode"),
-        "comfort": st.session_state.get("comfort"),
-        "dial_target": st.session_state.get("dial_target"),
-        "setpoints": st.session_state.get("setpoints"),
+        "hvac_mode": st.session_state.hvac_mode,
+        "comfort": st.session_state.comfort,
+        "indoor_temp": st.session_state.indoor_temp,
+        "humidity": st.session_state.humidity,
+        "air_quality": st.session_state.air_quality,
+        "setpoints": st.session_state.setpoints.get(st.session_state.comfort, {}),
     }
+
+    # Keep context short
+    history = st.session_state.assistant_messages[-8:]
 
     messages = [
         {
             "role": "system",
             "content": (
                 "You are an ecobee-style thermostat assistant. "
-                "Be concise. If user asks to change heat/cool setpoints, "
-                "suggest exact values and explain briefly."
+                "Be concise and practical. "
+                "If asked to change setpoints, propose exact HEAT and COOL values."
             ),
         },
         {"role": "system", "content": f"Current thermostat state: {state}"},
+        *history,
+        {"role": "user", "content": user_text},
     ]
 
-    for m in st.session_state.assistant_msgs[-6:]:
-        messages.append(m)
-
-    messages.append({"role": "user", "content": user_text})
-
     completion = client.chat.completions.create(
-        model="mistralai/devstral-2512:free",
+        model=model,
         messages=messages,
-        extra_headers={
-            "HTTP-Referer": site_url,
-            "X-Title": site_name,
-        },
+        extra_headers={"HTTP-Referer": site_url, "X-Title": site_name},
     )
     return completion.choices[0].message.content.strip()
 
@@ -133,7 +128,7 @@ BASE_BG = "#111827"
 CARD_BG = "#1F2937"
 MUTED = "#9CA3AF"
 WHITE = "#F9FAFB"
-ACCENT = "#F97316"   # orange (heat-ish)
+ACCENT = "#F97316"   # heat
 TEAL = "#22C55E"
 
 st.markdown(
@@ -143,7 +138,6 @@ st.markdown(
         background: radial-gradient(1200px 800px at 50% 30%, #0B1220 0%, {BASE_BG} 55%, #0A1020 100%);
         color: {WHITE};
       }}
-
       #MainMenu {{visibility: hidden;}}
       footer {{visibility: hidden;}}
       header {{visibility: hidden;}}
@@ -151,86 +145,54 @@ st.markdown(
       .frame {{
         max-width: 430px;
         margin: 0 auto;
-        padding: 18px 14px 160px 14px; /* extra room for assistant bar + bottom nav */
+        padding: 18px 14px 170px 14px; /* room for assistant bar + nav */
       }}
 
       .topbar {{
         display:flex; align-items:center; justify-content:space-between;
         padding: 8px 2px 14px 2px;
       }}
-      .topbar .title {{
-        font-size: 22px; font-weight: 600; letter-spacing: 0.2px;
-      }}
+      .topbar .title {{ font-size: 22px; font-weight: 600; letter-spacing: 0.2px; }}
       .iconbtn {{
         width: 38px; height: 38px; border-radius: 999px;
         display:flex; align-items:center; justify-content:center;
         border: 1px solid rgba(255,255,255,0.12);
-        color: {WHITE};
-        opacity: 0.95;
+        color: {WHITE}; opacity: 0.95;
       }}
 
       .statusrow {{
         display:flex; gap: 18px; justify-content:center; align-items:center;
-        color: {MUTED};
-        font-size: 15px;
-        margin-top: 10px;
+        color: {MUTED}; font-size: 15px; margin-top: 10px;
       }}
-      .statusrow .chip {{
-        display:flex; gap: 8px; align-items:center;
-      }}
+      .statusrow .chip {{ display:flex; gap: 8px; align-items:center; }}
 
       .bigtemp {{
-        text-align:center;
-        font-size: 120px;
-        line-height: 1.0;
-        font-weight: 300;
-        margin: 14px 0 8px 0;
-        color: {WHITE};
+        text-align:center; font-size: 120px; line-height: 1.0; font-weight: 300;
+        margin: 14px 0 8px 0; color: {WHITE};
       }}
 
       .comfortline {{
-        text-align:center;
-        color: {MUTED};
-        font-size: 20px;
-        display:flex;
-        justify-content:center;
-        gap: 10px;
-        align-items:center;
+        text-align:center; color: {MUTED}; font-size: 20px;
+        display:flex; justify-content:center; gap: 10px; align-items:center;
       }}
 
-      /* HOME setpoint pills (Heat/Cool) */
+      /* Home heat/cool pills */
       .pillRow {{
-        display:flex;
-        justify-content:center;
-        gap: 12px;
-        margin-top: 18px;
+        display:flex; justify-content:center; gap: 12px; margin-top: 18px;
       }}
       .pill {{
-        width: 132px;
-        border-radius: 999px;
-        padding: 10px 0;
-        text-align:center;
+        width: 132px; border-radius: 999px; padding: 10px 0; text-align:center;
         border: 2px solid rgba(255,255,255,0.14);
-        color: rgba(255,255,255,0.92);
-        font-weight: 800;
-        letter-spacing: 0.4px;
         background: rgba(255,255,255,0.03);
-        font-size: 16px;
+        font-weight: 800; letter-spacing: 0.4px;
       }}
       .pill .label {{
-        display:flex;
-        justify-content:center;
-        gap: 8px;
-        align-items:center;
-        font-size: 12px;
-        color: rgba(255,255,255,0.65);
-        font-weight: 650;
-        margin-bottom: 2px;
+        display:flex; justify-content:center; gap: 8px; align-items:center;
+        font-size: 12px; color: rgba(255,255,255,0.65); font-weight: 650; margin-bottom: 2px;
       }}
       .pill.heat {{
         border-color: rgba(249,115,22,0.75);
-        color: {ACCENT};
-        background: rgba(249,115,22,0.06);
+        color: {ACCENT}; background: rgba(249,115,22,0.06);
       }}
       .pill.cool {{
         border-color: rgba(96,165,250,0.75);
@@ -238,105 +200,63 @@ st.markdown(
         background: rgba(96,165,250,0.06);
       }}
 
-      /* Make Streamlit buttons less Streamlit (global) */
-      div.stButton > button {{
-        border-radius: 999px !important;
-        border: 1px solid rgba(255,255,255,0.12) !important;
-        background: rgba(255,255,255,0.03) !important;
-        color: {WHITE} !important;
-        padding: 10px 14px !important;
-      }}
-
       /* Dial */
       .dialWrap {{
-        position: relative;
-        height: 430px;
-        display:flex;
-        align-items:center;
-        justify-content:center;
+        position: relative; height: 430px;
+        display:flex; align-items:center; justify-content:center;
       }}
       .dialNums {{
-        position:absolute;
-        left:0; right:0;
-        text-align:center;
+        position:absolute; left:0; right:0; text-align:center;
         color: rgba(255,255,255,0.18);
-        font-size: 56px;
-        font-weight: 300;
-        line-height: 1.25;
+        font-size: 56px; font-weight: 300; line-height: 1.25;
       }}
       .dialCenter {{
-        width: 220px; height: 220px;
-        border-radius: 44px;
+        width: 220px; height: 220px; border-radius: 44px;
         display:flex; align-items:center; justify-content:center;
-        color: {WHITE};
-        font-size: 96px;
-        font-weight: 300;
+        color: {WHITE}; font-size: 96px; font-weight: 300;
         box-shadow: 0 12px 40px rgba(0,0,0,0.35);
       }}
       .dialCenter.heat {{ background: {ACCENT}; }}
       .dialCenter.cool {{ background: rgba(96,165,250,0.95); }}
 
       .dialBtnCol {{
-        position:absolute;
-        right: 10px;
-        display:flex;
-        flex-direction:column;
-        gap: 16px;
+        position:absolute; right: 10px; display:flex; flex-direction:column; gap: 16px;
       }}
       .dialBtnCol div.stButton > button {{
-        width: 58px !important;
-        height: 58px !important;
-        border-radius: 999px !important;
+        width: 58px !important; height: 58px !important; border-radius: 999px !important;
         border: 2px solid rgba(255,255,255,0.14) !important;
         background: rgba(255,255,255,0.05) !important;
-        color: {WHITE} !important;
-        font-size: 28px !important;
-        font-weight: 800 !important;
-        padding: 0 !important;
+        color: {WHITE} !important; font-size: 28px !important; font-weight: 800 !important; padding: 0 !important;
       }}
 
       /* Bottom nav */
       .bottomnav {{
-        position: fixed;
-        left: 0; right: 0; bottom: 0;
+        position: fixed; left: 0; right: 0; bottom: 0;
         padding: 10px 0 14px 0;
         background: rgba(17,24,39,0.85);
         backdrop-filter: blur(10px);
         border-top: 1px solid rgba(255,255,255,0.08);
       }}
       .bottomnav .inner {{
-        max-width: 430px;
-        margin: 0 auto;
-        display:flex;
-        justify-content:space-around;
-        align-items:center;
-        padding: 0 20px;
+        max-width: 430px; margin: 0 auto;
+        display:flex; justify-content:space-around; align-items:center; padding: 0 20px;
       }}
       .navitem {{
-        display:flex; flex-direction:column; align-items:center;
-        gap: 6px;
-        color: {MUTED};
-        font-size: 12px;
+        display:flex; flex-direction:column; align-items:center; gap: 6px;
+        color: {MUTED}; font-size: 12px;
       }}
-      .navdot {{
-        width: 10px; height: 10px; border-radius: 999px;
-        background: rgba(255,255,255,0.12);
-      }}
+      .navdot {{ width: 10px; height: 10px; border-radius: 999px; background: rgba(255,255,255,0.12); }}
       .navitem.active {{ color: {TEAL}; }}
       .navitem.active .navdot {{ background: {TEAL}; }}
 
-      /* Assistant bar (fixed above bottom nav) */
+      /* Assistant bar FIXED above bottom nav */
       .assistantbar {{
-        position: fixed;
-        left: 0; right: 0;
-        bottom: 86px;
+        position: fixed; left: 0; right: 0; bottom: 86px;
         padding: 10px 0 12px 0;
         pointer-events: none;
       }}
       .assistantbar .inner {{
-        max-width: 430px;
-        margin: 0 auto;
-        padding: 0 14px;
+        max-width: 430px; margin: 0 auto; padding: 0 14px;
         pointer-events: auto;
       }}
       .assistantbubble {{
@@ -348,17 +268,9 @@ st.markdown(
         padding: 10px 12px;
       }}
       .assistantbubble .reply {{
-        color: rgba(255,255,255,0.88);
-        font-size: 13px;
-        line-height: 1.3;
+        color: rgba(255,255,255,0.90);
+        font-size: 13px; line-height: 1.3;
         margin-bottom: 8px;
-        max-height: 48px;
-        overflow: hidden;
-      }}
-      .assistantbubble .hint {{
-        color: rgba(156,163,175,0.95);
-        font-size: 11px;
-        margin-top: 6px;
       }}
 
       .assistantInput .stTextInput input {{
@@ -367,6 +279,15 @@ st.markdown(
         background: rgba(255,255,255,0.04) !important;
         border: 1px solid rgba(255,255,255,0.10) !important;
         color: {WHITE} !important;
+      }}
+
+      /* Global button style */
+      div.stButton > button {{
+        border-radius: 999px !important;
+        border: 1px solid rgba(255,255,255,0.12) !important;
+        background: rgba(255,255,255,0.03) !important;
+        color: {WHITE} !important;
+        padding: 10px 14px !important;
       }}
     </style>
     """,
@@ -423,100 +344,53 @@ def bottom_nav():
         unsafe_allow_html=True,
     )
 
-from openai import OpenAI
+def assistant_bar():
+    # FIX: include .inner so pointer-events works + SHOW the reply bubble
+    st.markdown('<div class="assistantbar"><div class="inner">', unsafe_allow_html=True)
 
-def get_openrouter_client() -> OpenAI:
-    api_key = st.secrets.get("OPENROUTER_API_KEY", "")
-    if not api_key:
-        st.error("Missing OPENROUTER_API_KEY in Streamlit secrets.")
-        st.stop()
-    return OpenAI(base_url="https://openrouter.ai/api/v1", api_key=api_key)
-
-def call_openrouter(conversation_messages, model="mistralai/devstral-2512:free") -> str:
-    """
-    conversation_messages: list of dicts like:
-      [{"role":"user","content":"..."}, {"role":"assistant","content":"..."}]
-    Returns: assistant text
-    """
-    client = get_openrouter_client()
-
-    site_url = st.secrets.get("YOUR_SITE_URL", "")
-    site_name = st.secrets.get("YOUR_SITE_NAME", "Streamlit Ecobee")
-
-    # Keep it short (prevents token bloat + keeps UI snappy)
-    recent = conversation_messages[-10:]
-
-    # Add a system instruction (ecobee assistant vibe)
-    messages = [
-        {
-            "role": "system",
-            "content": (
-                "You are an ecobee-style thermostat assistant. "
-                "Be concise, practical, and friendly. "
-                "If the user asks to change setpoints, propose exact heat/cool values."
-            ),
-        },
-        *recent,
-    ]
-
-    completion = client.chat.completions.create(
-        model=model,
-        messages=messages,
-        extra_headers={
-            "HTTP-Referer": site_url,
-            "X-Title": site_name,
-        },
+    st.markdown(
+        f"""
+        <div class="assistantbubble">
+          <div class="reply">{st.session_state.assistant_last_reply}</div>
+        </div>
+        """,
+        unsafe_allow_html=True,
     )
 
-    return completion.choices[0].message.content.strip()
-
-
-def assistant_bar():
-    # init once (safe)
-    if "assistant_messages" not in st.session_state:
-        st.session_state.assistant_messages = []  # list of dicts {role, content}
-
-    st.markdown('<div class="assistantbar">', unsafe_allow_html=True)
-
+    # Input + send
     with st.form("assistant_form", clear_on_submit=True):
+        st.markdown('<div class="assistantInput">', unsafe_allow_html=True)
         user_msg = st.text_input(
             "Assistant",
-            key="assistant_input",                # OK: owned by the widget
+            key="assistant_input",
             placeholder="Ask the assistant…",
             label_visibility="collapsed",
         )
+        st.markdown("</div>", unsafe_allow_html=True)
         sent = st.form_submit_button("Send")
 
-    st.markdown("</div>", unsafe_allow_html=True)
+    st.markdown("</div></div>", unsafe_allow_html=True)  # close inner + assistantbar
 
     if sent:
         user_msg = (user_msg or "").strip()
         if not user_msg:
             return
 
-        # store user message
+        # Save user message
         st.session_state.assistant_messages.append({"role": "user", "content": user_msg})
 
-        # call OpenRouter here (example)
-        reply = call_openrouter(st.session_state.assistant_messages)
+        # Call model (with visible spinner + visible errors)
+        try:
+            with st.spinner("Thinking…"):
+                reply = call_openrouter(user_msg)
+        except Exception as e:
+            st.session_state.assistant_last_reply = f"LLM error: {e}"
+            st.rerun()
+
+        # Save assistant reply
         st.session_state.assistant_messages.append({"role": "assistant", "content": reply})
-
+        st.session_state.assistant_last_reply = reply
         st.rerun()
-
-
-    st.markdown(
-        "<div class='hint'>Tip: The assistant has access to current mode, comfort, and heat/cool setpoints.</div>",
-        unsafe_allow_html=True,
-    )
-
-    st.markdown(
-        """
-            </div>
-          </div>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
 
 # =========================================================
 # Views
@@ -557,7 +431,6 @@ if st.session_state.view == "Home":
         unsafe_allow_html=True,
     )
 
-    # Real buttons aligned under the visual pills (no "new windows"; just state change)
     colA, colB = st.columns(2)
     with colA:
         if st.button("Adjust Heat", use_container_width=True):
@@ -570,8 +443,6 @@ if st.session_state.view == "Home":
             st.session_state.view = "Dial"
             st.rerun()
 
-    st.caption("Tip: Adjust heat/cool setpoints using the Dial.")
-
 elif st.session_state.view == "Dial":
     target = st.session_state.dial_target
     topbar("Setpoint", left_symbol="←", right_symbol="")
@@ -581,7 +452,6 @@ elif st.session_state.view == "Dial":
     label = "🔥 Heat" if target == "heat" else "❄️ Cool"
 
     st.markdown('<div class="dialWrap">', unsafe_allow_html=True)
-
     st.markdown(
         f"""
         <div class="dialNums">
@@ -594,7 +464,6 @@ elif st.session_state.view == "Dial":
         """,
         unsafe_allow_html=True,
     )
-
     st.markdown(f'<div class="dialCenter {center_class}">{sp}</div>', unsafe_allow_html=True)
 
     st.markdown('<div class="dialBtnCol">', unsafe_allow_html=True)
@@ -612,13 +481,12 @@ elif st.session_state.view == "Dial":
         st.rerun()
 
     st.write(f"Editing: **{label}** for **{st.session_state.comfort}**")
-
     if st.button("Back to Home", use_container_width=True):
         st.session_state.view = "Home"
         st.rerun()
 
 elif st.session_state.view == "Reports":
-    topbar("Reports", left_symbol="＋", right_symbol="👤", left_hint="Add", right_hint="Profile")
+    topbar("Reports", left_symbol="＋", right_symbol="👤")
     st.markdown(
         f"""
         <div style="background: rgba(31,41,55,0.9); border: 1px solid rgba(255,255,255,0.08);
@@ -634,29 +502,10 @@ elif st.session_state.view == "Reports":
         """,
         unsafe_allow_html=True,
     )
-    st.info("Hook your real telemetry later (runtime, clusters, schedules). This is the placeholder tab.")
 
 elif st.session_state.view == "Menu":
     topbar("Main Menu", left_symbol="✕", right_symbol="")
     st.text_input("Search thermostat settings", placeholder="Search thermostat settings")
-
-    st.markdown(
-        f"""
-        <div style="background: rgba(31,41,55,0.9); border: 1px solid rgba(255,255,255,0.08);
-                    border-radius: 18px; padding: 14px 14px;">
-          <div style="padding: 12px 4px; border-bottom: 1px solid rgba(255,255,255,0.06); display:flex; justify-content:space-between;">
-            <div style="display:flex; gap:12px; align-items:center;">{ico('e')} <b>eco+</b></div><div style="opacity:0.55;">›</div>
-          </div>
-          <div style="padding: 12px 4px; border-bottom: 1px solid rgba(255,255,255,0.06); display:flex; justify-content:space-between;">
-            <div style="display:flex; gap:12px; align-items:center;">{ico('🛠')} <b>System</b></div><div style="opacity:0.55;">›</div>
-          </div>
-          <div style="padding: 12px 4px; border-bottom: 1px solid rgba(255,255,255,0.06); display:flex; justify-content:space-between;">
-            <div style="display:flex; gap:12px; align-items:center;">{ico('🛋')} <b>Comfort Settings</b></div><div style="opacity:0.55;">›</div>
-          </div>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
 
     if st.button("Open Comfort Settings", use_container_width=True):
         st.session_state.view = "Comfort"
@@ -697,7 +546,6 @@ elif st.session_state.view == "Comfort":
             )
             set_sp(k, "cool", int(v_cool))
 
-    st.markdown("<div style='height:10px'></div>", unsafe_allow_html=True)
     st.session_state.comfort = st.selectbox(
         "Active comfort",
         list(st.session_state.setpoints.keys()),
