@@ -1,7 +1,10 @@
+# app.py
+# Ecobee-style Streamlit UI + OpenRouter assistant + Open-Meteo outdoor temp (with location picker)
+# -------------------------------------------------------------
+
 import json
 import re
-from datetime import datetime, timedelta
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, Optional, Tuple, List
 
 import requests
 import streamlit as st
@@ -45,13 +48,16 @@ def init_state():
     ss.setdefault("assistant_messages", [])
     ss.setdefault("assistant_last_reply", "Ask me anything about your thermostat.")
     ss.setdefault("pending_action", None)   # dict or None
-    ss.setdefault("pending_explainer", "")  # why/impact text from assistant
+    ss.setdefault("pending_explainer", "")  # why/impact text
 
     # Location + weather
     ss.setdefault("location", "Berkeley, CA")
     ss.setdefault("outdoor_temp_f", None)  # float or None
     ss.setdefault("weather_status", "Not updated")
-    ss.setdefault("outdoor_last_update", None)  # datetime or None
+
+    # Geocoding candidates
+    ss.setdefault("geo_results", [])       # list of dicts
+    ss.setdefault("geo_choice", 0)         # index in geo_results
 
 init_state()
 
@@ -86,29 +92,31 @@ def fan_label() -> str:
 
 # =========================================================
 # Weather via Open-Meteo (free, no key)
+#   - Geocoding returns multiple candidates; user picks one
 # =========================================================
-def fetch_openmeteo_current(location_text: str) -> Tuple[Optional[Dict[str, Any]], str]:
-    """
-    Open-Meteo geocoding + current weather.
-    Returns (data_or_none, status_message)
+def geocode_candidates(location_text: str) -> Tuple[List[dict], str]:
+    q = (location_text or "").strip()
+    if not q:
+        return [], "Type a location first."
 
-    data includes: temp_f, wind_mph, weather_code, name, lat, lon
-    """
     try:
         geo = requests.get(
             "https://geocoding-api.open-meteo.com/v1/search",
-            params={"name": location_text, "count": 1, "language": "en", "format": "json"},
+            params={"name": q, "count": 5, "language": "en", "format": "json"},
             timeout=10,
         )
         geo.raise_for_status()
         gj = geo.json()
-        if not gj.get("results"):
-            return None, "Location not found"
+        results = gj.get("results") or []
+        if not results:
+            # Helpful hint for the exact case you mentioned
+            return [], f"No matches for '{q}'. Try: 'Berkeley California USA' (this one always works)."
+        return results, f"Found {len(results)} match(es) for '{q}'."
+    except Exception as e:
+        return [], f"Geocoding error: {e}"
 
-        r = gj["results"][0]
-        lat, lon = r["latitude"], r["longitude"]
-        nice_name = f"{r.get('name','')}, {r.get('admin1','')}, {r.get('country_code','')}".strip(", ")
-
+def fetch_current_weather_f(lat: float, lon: float) -> Tuple[Optional[float], str]:
+    try:
         wx = requests.get(
             "https://api.open-meteo.com/v1/forecast",
             params={
@@ -124,41 +132,23 @@ def fetch_openmeteo_current(location_text: str) -> Tuple[Optional[Dict[str, Any]
         wj = wx.json()
         cw = wj.get("current_weather", {})
         if "temperature" not in cw:
-            return None, f"Weather unavailable for {nice_name}"
-
-        data = {
-            "temp_f": float(cw["temperature"]),
-            "wind_mph": float(cw.get("windspeed", 0.0)),
-            "weather_code": int(cw.get("weathercode", -1)),
-            "lat": float(lat),
-            "lon": float(lon),
-            "name": nice_name,
-        }
-        return data, f"Updated from Open-Meteo for {nice_name}"
+            return None, "Weather unavailable (no temperature in response)."
+        return float(cw["temperature"]), "OK"
     except Exception as e:
         return None, f"Weather error: {e}"
 
-def maybe_refresh_outdoor(minutes: int = 15):
-    """
-    Auto-refresh outdoor temp if stale.
-    Keeps API calls under control.
-    """
-    last = st.session_state.outdoor_last_update
-    if last and isinstance(last, datetime):
-        if (datetime.utcnow() - last) < timedelta(minutes=minutes):
-            return
-
-    data, status = fetch_openmeteo_current(st.session_state.location)
-    st.session_state.weather_status = status
-    if data:
-        st.session_state.outdoor_temp_f = data["temp_f"]
-        st.session_state.outdoor_last_update = datetime.utcnow()
-
-# Optional: uncomment to auto-refresh while app runs
-# maybe_refresh_outdoor(minutes=15)
+def nice_place(r: dict) -> str:
+    name = r.get("name", "")
+    admin1 = r.get("admin1", "")
+    country = r.get("country", "")
+    cc = r.get("country_code", "")
+    if country and cc:
+        country = f"{country} ({cc})"
+    parts = [p for p in [name, admin1, country] if p]
+    return ", ".join(parts) if parts else "Unknown"
 
 # =========================================================
-# OpenRouter client
+# OpenRouter client (LLM)
 # =========================================================
 def get_openrouter_client() -> OpenAI:
     api_key = st.secrets.get("OPENROUTER_API_KEY", "")
@@ -189,10 +179,6 @@ def thermostat_state_summary() -> Dict[str, Any]:
 ACTION_TAG_RE = re.compile(r"<ACTION>\s*(\{.*?\})\s*</ACTION>", re.DOTALL)
 
 def parse_action_from_text(text: str) -> Tuple[Optional[Dict[str, Any]], str]:
-    """
-    Looks for an <ACTION>{json}</ACTION> block.
-    Returns (action_dict_or_none, cleaned_text_without_action_block).
-    """
     m = ACTION_TAG_RE.search(text)
     if not m:
         return None, text.strip()
@@ -229,9 +215,8 @@ def call_openrouter(user_text: str, model: str = "mistralai/devstral-2512:free")
         "- set_location: {\"type\":\"set_location\",\"location\":\"text\"}\n\n"
         "Important:\n"
         "- Never claim the change has already happened. Only propose it.\n"
-        "- Mention comfort/energy tradeoffs briefly BEFORE proposing the action.\n"
-        "- If user asks to switch mode/fan/etc, propose it as an action.\n"
-        "- If user asks for climate reasoning, use location and outdoor_temp if available.\n"
+        "- Mention comfort/energy tradeoffs briefly before proposing the action.\n"
+        "- If the user asks for climate reasoning, use location and outdoor_temp if available.\n"
     )
 
     messages = [
@@ -252,9 +237,6 @@ def call_openrouter(user_text: str, model: str = "mistralai/devstral-2512:free")
     return cleaned, action
 
 def apply_action(action: Dict[str, Any]) -> str:
-    """
-    Applies action to session_state. Returns a short status string.
-    """
     t = action.get("type")
 
     if t == "set_hvac_mode":
@@ -304,7 +286,8 @@ def apply_action(action: Dict[str, Any]) -> str:
         st.session_state.location = loc
         st.session_state.outdoor_temp_f = None
         st.session_state.weather_status = "Not updated"
-        st.session_state.outdoor_last_update = None
+        st.session_state.geo_results = []
+        st.session_state.geo_choice = 0
         return f"Applied: Location → {loc}"
 
     return "Unknown action type"
@@ -332,7 +315,7 @@ st.markdown(
       .frame {{
         max-width: 430px;
         margin: 0 auto;
-        padding: 18px 14px 210px 14px;
+        padding: 18px 14px 190px 14px;
       }}
 
       .topbar {{
@@ -348,8 +331,8 @@ st.markdown(
       }}
 
       .statusrow {{
-        display:flex; gap: 10px; justify-content:center; align-items:center;
-        color: {MUTED}; font-size: 14px; margin-top: 10px; flex-wrap: wrap;
+        display:flex; gap: 12px; justify-content:center; align-items:center;
+        color: {MUTED}; font-size: 13px; margin-top: 10px; flex-wrap: wrap;
       }}
       .statusrow .chip {{
         display:flex; gap: 8px; align-items:center;
@@ -420,35 +403,6 @@ st.markdown(
         color: {WHITE} !important; font-size: 28px !important; font-weight: 800 !important; padding: 0 !important;
       }}
 
-      /* Assistant bar */
-      .assistantbar {{
-        position: fixed; left: 0; right: 0; bottom: 86px;
-        padding: 10px 0 12px 0; pointer-events: none;
-      }}
-      .assistantbar .inner {{
-        max-width: 430px; margin: 0 auto; padding: 0 14px; pointer-events: auto;
-      }}
-      .assistantbubble {{
-        width: 100%;
-        border-radius: 18px;
-        border: 1px solid rgba(255,255,255,0.10);
-        background: rgba(17,24,39,0.75);
-        backdrop-filter: blur(10px);
-        padding: 10px 12px;
-      }}
-      .assistantbubble .reply {{
-        color: rgba(255,255,255,0.90);
-        font-size: 13px; line-height: 1.3;
-        margin-bottom: 8px;
-      }}
-      .pending {{
-        margin-top: 8px;
-        border-top: 1px solid rgba(255,255,255,0.08);
-        padding-top: 8px;
-        color: rgba(255,255,255,0.82);
-        font-size: 12px;
-      }}
-
       /* Bottom nav */
       .bottomnav {{
         position: fixed; left: 0; right: 0; bottom: 0;
@@ -468,6 +422,35 @@ st.markdown(
       .navdot {{ width: 10px; height: 10px; border-radius: 999px; background: rgba(255,255,255,0.12); }}
       .navitem.active {{ color: {TEAL}; }}
       .navitem.active .navdot {{ background: {TEAL}; }}
+
+      /* Assistant bar */
+      .assistantbar {{
+        position: fixed; left: 0; right: 0; bottom: 86px;
+        padding: 10px 0 12px 0; pointer-events: none;
+      }}
+      .assistantbar .inner {{
+        max-width: 430px; margin: 0 auto; padding: 0 14px; pointer-events: auto;
+      }}
+      .assistantbubble {{
+        width: 100%;
+        border-radius: 18px;
+        border: 1px solid rgba(255,255,255,0.10);
+        background: rgba(17,24,39,0.75);
+        backdrop-filter: blur(10px);
+        padding: 10px 12px;
+      }}
+      .assistantbubble .reply {{
+        color: rgba(255,255,255,0.92);
+        font-size: 13px; line-height: 1.35;
+        margin-bottom: 8px;
+      }}
+      .pending {{
+        margin-top: 8px;
+        border-top: 1px solid rgba(255,255,255,0.08);
+        padding-top: 8px;
+        color: rgba(255,255,255,0.82);
+        font-size: 12px;
+      }}
 
       div.stButton > button {{
         border-radius: 999px !important;
@@ -589,7 +572,7 @@ def assistant_bar():
         user_msg = st.text_input(
             "Assistant",
             key="assistant_input",
-            placeholder="Ask… e.g. 'Switch to Auto', 'Fan On', 'Set Sleep cool to 78', 'Set location to Monterrey'",
+            placeholder="Ask… e.g. 'Switch to Auto', 'Fan On', 'Set Sleep cool to 78', 'Set location to Berkeley CA'",
             label_visibility="collapsed",
         )
         sent = st.form_submit_button("Send")
@@ -640,14 +623,13 @@ if st.session_state.view == "Home":
           <div class="chip">{ico('🌬')} <b style="color:{WHITE}">{st.session_state.air_quality}</b></div>
           <div class="chip">{ico('📍')} <b style="color:{WHITE}">{st.session_state.location}</b></div>
           <div class="chip">{ico('🌡️')} <b style="color:{WHITE}">{outdoor_chip}</b></div>
-          <div class="chip">{ico('🌀')} <b style="color:{WHITE}">Fan {fan_label()}</b></div>
-          <div class="chip">{ico('🧠')} <b style="color:{WHITE}">{st.session_state.hvac_mode}</b></div>
         </div>
         """,
         unsafe_allow_html=True,
     )
 
     st.markdown(f'<div class="bigtemp">{st.session_state.indoor_temp}</div>', unsafe_allow_html=True)
+
     st.markdown(
         f"""
         <div class="comfortline">
@@ -657,7 +639,7 @@ if st.session_state.view == "Home":
         unsafe_allow_html=True,
     )
 
-    # Mode + fan controls (LLM can propose changes; user confirms)
+    # Mode + fan controls (the assistant can propose changing these)
     c1, c2 = st.columns([1.4, 1.0])
     with c1:
         hvac_modes = ["Off", "Heat", "Cool", "Auto", "Aux"]
@@ -665,6 +647,7 @@ if st.session_state.view == "Home":
             "System Mode",
             hvac_modes,
             index=hvac_modes.index(st.session_state.hvac_mode),
+            label_visibility="collapsed",
         )
     with c2:
         st.session_state.fan_on = st.toggle("Fan On", value=st.session_state.fan_on)
@@ -699,21 +682,63 @@ if st.session_state.view == "Home":
 
     st.markdown("<div style='height:10px'></div>", unsafe_allow_html=True)
 
-    colL, colW = st.columns([1.4, 1.0])
-    with colL:
-        st.session_state.location = st.text_input("Location", value=st.session_state.location)
-    with colW:
-        if st.button("Update outdoor", use_container_width=True):
-            data, status = fetch_openmeteo_current(st.session_state.location)
+    # Location + outdoor temperature update (robust)
+    st.session_state.location = st.text_input("Location", value=st.session_state.location, label_visibility="collapsed")
+
+    cL1, cL2 = st.columns([1.0, 1.0])
+    with cL1:
+        if st.button("Find location", use_container_width=True):
+            results, status = geocode_candidates(st.session_state.location)
+            st.session_state.geo_results = results
+            st.session_state.geo_choice = 0
             st.session_state.weather_status = status
-            if data:
-                st.session_state.outdoor_temp_f = data["temp_f"]
-                st.session_state.outdoor_last_update = datetime.utcnow()
-                st.session_state.assistant_last_reply = f"{status}. Outdoor now {data['temp_f']:.0f}°F."
-            else:
-                st.session_state.outdoor_temp_f = None
-                st.session_state.assistant_last_reply = status
+            # Make the assistant bubble show it too
+            st.session_state.assistant_last_reply = status
             st.rerun()
+
+    with cL2:
+        if st.button("Update outdoor temp", use_container_width=True):
+            results = st.session_state.geo_results
+
+            if not results:
+                results, status = geocode_candidates(st.session_state.location)
+                st.session_state.geo_results = results
+                st.session_state.weather_status = status
+                if not results:
+                    st.session_state.outdoor_temp_f = None
+                    st.session_state.assistant_last_reply = status
+                    st.rerun()
+
+            idx = min(int(st.session_state.geo_choice), len(st.session_state.geo_results) - 1)
+            chosen = st.session_state.geo_results[idx]
+            lat, lon = chosen["latitude"], chosen["longitude"]
+
+            temp_f, ok = fetch_current_weather_f(lat, lon)
+            place = nice_place(chosen)
+
+            if temp_f is None:
+                st.session_state.outdoor_temp_f = None
+                st.session_state.weather_status = f"{ok} For {place}"
+                st.session_state.assistant_last_reply = st.session_state.weather_status
+            else:
+                st.session_state.outdoor_temp_f = temp_f
+                st.session_state.weather_status = f"Updated from Open-Meteo for {place}"
+                st.session_state.assistant_last_reply = f"{st.session_state.weather_status}. Outdoor now {temp_f:.0f}°F."
+
+            st.rerun()
+
+    # If candidates exist, let user pick the correct one (this fixes 'Berkeley, CA' edge cases)
+    if st.session_state.geo_results:
+        labels = [
+            f"{nice_place(r)} • ({r.get('latitude'):.3f}, {r.get('longitude'):.3f})"
+            for r in st.session_state.geo_results
+        ]
+        st.session_state.geo_choice = st.selectbox(
+            "Select match",
+            list(range(len(labels))),
+            index=min(st.session_state.geo_choice, len(labels)-1),
+            format_func=lambda i: labels[i],
+        )
 
     st.caption(st.session_state.weather_status)
 
@@ -770,7 +795,6 @@ elif st.session_state.view == "Menu":
 
 elif st.session_state.view == "Comfort":
     topbar("Comfort Settings", left_symbol="←", right_symbol="＋")
-
     st.markdown(
         """
         <div style="color:rgba(255,255,255,0.7); font-size:15px; line-height:1.4; margin-bottom:14px;">
