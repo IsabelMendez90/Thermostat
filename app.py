@@ -18,8 +18,12 @@ if "humidity" not in st.session_state:
     st.session_state.humidity = 51
 if "air_quality" not in st.session_state:
     st.session_state.air_quality = "Fair"
+
+# System mode + fan mode (NEW)
 if "hvac_mode" not in st.session_state:
     st.session_state.hvac_mode = "Heat"  # Heat / Cool / Auto / Off
+if "fan_mode" not in st.session_state:
+    st.session_state.fan_mode = "Auto"   # Auto / On
 
 if "comfort" not in st.session_state:
     st.session_state.comfort = "Away"  # Home / Away / Sleep / Morning
@@ -83,30 +87,38 @@ def get_openrouter_client() -> OpenAI:
 
 def call_openrouter(user_text: str, model: str = "mistralai/devstral-2512:free") -> str:
     client = get_openrouter_client()
-
     site_url = st.secrets.get("YOUR_SITE_URL", "")
     site_name = st.secrets.get("YOUR_SITE_NAME", "Streamlit Ecobee")
 
-    # Provide compact state context (so it acts “inside” your thermostat)
     state = {
         "hvac_mode": st.session_state.hvac_mode,
+        "fan_mode": st.session_state.fan_mode,
         "comfort": st.session_state.comfort,
         "indoor_temp": st.session_state.indoor_temp,
         "humidity": st.session_state.humidity,
         "air_quality": st.session_state.air_quality,
-        "setpoints": st.session_state.setpoints.get(st.session_state.comfort, {}),
+        "active_setpoints": st.session_state.setpoints.get(st.session_state.comfort, {}),
+        "available_controls": {
+            "hvac_mode": ["Heat", "Cool", "Auto", "Off"],
+            "fan_mode": ["Auto", "On"],
+            "comfort": list(st.session_state.setpoints.keys()),
+            "setpoints": ["heat", "cool"],
+        },
     }
 
-    # Keep context short
     history = st.session_state.assistant_messages[-8:]
 
     messages = [
         {
             "role": "system",
             "content": (
-                "You are an ecobee-style thermostat assistant. "
-                "Be concise and practical. "
-                "If asked to change setpoints, propose exact HEAT and COOL values."
+                "You are an ecobee-style thermostat assistant inside a Streamlit UI.\n"
+                "Only recommend actions that exist in the UI: change HVAC mode (Heat/Cool/Auto/Off), "
+                "change Fan mode (Auto/On), change Comfort (Home/Away/Sleep/Morning), "
+                "and adjust heat/cool setpoints.\n"
+                "Be concise and practical. If you recommend switching a mode, say exactly which mode.\n"
+                "If asked to change setpoints, propose exact HEAT and/or COOL values.\n"
+                "Do NOT mention controls that are not available."
             ),
         },
         {"role": "system", "content": f"Current thermostat state: {state}"},
@@ -122,12 +134,11 @@ def call_openrouter(user_text: str, model: str = "mistralai/devstral-2512:free")
     return completion.choices[0].message.content.strip()
 
 # =========================================================
-# Styling (ecobee-ish)
+# Styling
 # =========================================================
 BASE_BG = "#111827"
-CARD_BG = "#1F2937"
-MUTED = "#9CA3AF"
 WHITE = "#F9FAFB"
+MUTED = "#9CA3AF"
 ACCENT = "#F97316"   # heat
 TEAL = "#22C55E"
 
@@ -145,7 +156,7 @@ st.markdown(
       .frame {{
         max-width: 430px;
         margin: 0 auto;
-        padding: 18px 14px 170px 14px; /* room for assistant bar + nav */
+        padding: 18px 14px 170px 14px;
       }}
 
       .topbar {{
@@ -176,9 +187,27 @@ st.markdown(
         display:flex; justify-content:center; gap: 10px; align-items:center;
       }}
 
+      /* Mode row */
+      .moderow {{
+        display:flex;
+        justify-content:center;
+        gap: 10px;
+        margin-top: 14px;
+        flex-wrap: wrap;
+      }}
+      .modepill {{
+        padding: 8px 12px;
+        border-radius: 999px;
+        border: 1px solid rgba(255,255,255,0.14);
+        background: rgba(255,255,255,0.03);
+        color: rgba(255,255,255,0.9);
+        font-size: 12px;
+        font-weight: 700;
+      }}
+
       /* Home heat/cool pills */
       .pillRow {{
-        display:flex; justify-content:center; gap: 12px; margin-top: 18px;
+        display:flex; justify-content:center; gap: 12px; margin-top: 16px;
       }}
       .pill {{
         width: 132px; border-radius: 999px; padding: 10px 0; text-align:center;
@@ -249,15 +278,13 @@ st.markdown(
       .navitem.active {{ color: {TEAL}; }}
       .navitem.active .navdot {{ background: {TEAL}; }}
 
-      /* Assistant bar FIXED above bottom nav */
+      /* Assistant bar */
       .assistantbar {{
         position: fixed; left: 0; right: 0; bottom: 86px;
-        padding: 10px 0 12px 0;
-        pointer-events: none;
+        padding: 10px 0 12px 0; pointer-events: none;
       }}
       .assistantbar .inner {{
-        max-width: 430px; margin: 0 auto; padding: 0 14px;
-        pointer-events: auto;
+        max-width: 430px; margin: 0 auto; padding: 0 14px; pointer-events: auto;
       }}
       .assistantbubble {{
         width: 100%;
@@ -281,7 +308,6 @@ st.markdown(
         color: {WHITE} !important;
       }}
 
-      /* Global button style */
       div.stButton > button {{
         border-radius: 999px !important;
         border: 1px solid rgba(255,255,255,0.12) !important;
@@ -297,17 +323,58 @@ st.markdown(
 # =========================================================
 # UI helpers
 # =========================================================
-def topbar(title: str, left_symbol="👤", right_symbol="⚙", left_hint="User", right_hint="Settings"):
+def topbar(title: str, left_symbol="👤", right_symbol="⚙"):
     st.markdown(
         f"""
         <div class="topbar">
-          <div class="iconbtn" title="{left_hint}">{left_symbol}</div>
+          <div class="iconbtn">{left_symbol}</div>
           <div class="title">{title}</div>
-          <div class="iconbtn" title="{right_hint}">{right_symbol}</div>
+          <div class="iconbtn">{right_symbol}</div>
         </div>
         """,
         unsafe_allow_html=True,
     )
+
+def assistant_bar():
+    st.markdown('<div class="assistantbar"><div class="inner">', unsafe_allow_html=True)
+    st.markdown(
+        f"""
+        <div class="assistantbubble">
+          <div class="reply">{st.session_state.assistant_last_reply}</div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    with st.form("assistant_form", clear_on_submit=True):
+        st.markdown('<div class="assistantInput">', unsafe_allow_html=True)
+        user_msg = st.text_input(
+            "Assistant",
+            key="assistant_input",
+            placeholder="Ask the assistant… (e.g., 'Switch to Auto' or 'Set Sleep heat to 65')",
+            label_visibility="collapsed",
+        )
+        st.markdown("</div>", unsafe_allow_html=True)
+        sent = st.form_submit_button("Send")
+
+    st.markdown("</div></div>", unsafe_allow_html=True)
+
+    if sent:
+        user_msg = (user_msg or "").strip()
+        if not user_msg:
+            return
+
+        st.session_state.assistant_messages.append({"role": "user", "content": user_msg})
+        try:
+            with st.spinner("Thinking…"):
+                reply = call_openrouter(user_msg)
+        except Exception as e:
+            st.session_state.assistant_last_reply = f"LLM error: {e}"
+            st.rerun()
+
+        st.session_state.assistant_messages.append({"role": "assistant", "content": reply})
+        st.session_state.assistant_last_reply = reply
+        st.rerun()
 
 def bottom_nav():
     c1, c2, c3 = st.columns(3)
@@ -344,54 +411,6 @@ def bottom_nav():
         unsafe_allow_html=True,
     )
 
-def assistant_bar():
-    # FIX: include .inner so pointer-events works + SHOW the reply bubble
-    st.markdown('<div class="assistantbar"><div class="inner">', unsafe_allow_html=True)
-
-    st.markdown(
-        f"""
-        <div class="assistantbubble">
-          <div class="reply">{st.session_state.assistant_last_reply}</div>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-
-    # Input + send
-    with st.form("assistant_form", clear_on_submit=True):
-        st.markdown('<div class="assistantInput">', unsafe_allow_html=True)
-        user_msg = st.text_input(
-            "Assistant",
-            key="assistant_input",
-            placeholder="Ask the assistant…",
-            label_visibility="collapsed",
-        )
-        st.markdown("</div>", unsafe_allow_html=True)
-        sent = st.form_submit_button("Send")
-
-    st.markdown("</div></div>", unsafe_allow_html=True)  # close inner + assistantbar
-
-    if sent:
-        user_msg = (user_msg or "").strip()
-        if not user_msg:
-            return
-
-        # Save user message
-        st.session_state.assistant_messages.append({"role": "user", "content": user_msg})
-
-        # Call model (with visible spinner + visible errors)
-        try:
-            with st.spinner("Thinking…"):
-                reply = call_openrouter(user_msg)
-        except Exception as e:
-            st.session_state.assistant_last_reply = f"LLM error: {e}"
-            st.rerun()
-
-        # Save assistant reply
-        st.session_state.assistant_messages.append({"role": "assistant", "content": reply})
-        st.session_state.assistant_last_reply = reply
-        st.rerun()
-
 # =========================================================
 # Views
 # =========================================================
@@ -403,20 +422,58 @@ if st.session_state.view == "Home":
     heat_sp = get_sp(st.session_state.comfort, "heat")
     cool_sp = get_sp(st.session_state.comfort, "cool")
 
+    # status chips
     st.markdown(
         f"""
         <div class="statusrow">
           <div class="chip">{ico('💧')} <b style="color:{WHITE}">{st.session_state.humidity}%</b></div>
-          <div class="chip">{ico('🔥')} <b style="color:{WHITE}">{st.session_state.hvac_mode}</b></div>
           <div class="chip">{ico('🌬')} <b style="color:{WHITE}">{st.session_state.air_quality}</b></div>
         </div>
+        """,
+        unsafe_allow_html=True,
+    )
 
-        <div class="bigtemp">{st.session_state.indoor_temp}</div>
-
+    st.markdown(f'<div class="bigtemp">{st.session_state.indoor_temp}</div>', unsafe_allow_html=True)
+    st.markdown(
+        f"""
         <div class="comfortline">
           {ico(comfort_icon(st.session_state.comfort))} <span>{st.session_state.comfort}</span>
         </div>
+        """,
+        unsafe_allow_html=True,
+    )
 
+    # NEW: Mode selectors (built-in, not fake)
+    st.markdown(
+        f"""
+        <div class="moderow">
+          <div class="modepill">{ico('🧠')} Mode: <b>{st.session_state.hvac_mode}</b></div>
+          <div class="modepill">{ico('🌀')} Fan: <b>{st.session_state.fan_mode}</b></div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    # Simple selectors (real controls)
+    colM, colF = st.columns(2)
+    with colM:
+        st.session_state.hvac_mode = st.selectbox(
+            "System Mode",
+            ["Heat", "Cool", "Auto", "Off"],
+            index=["Heat", "Cool", "Auto", "Off"].index(st.session_state.hvac_mode),
+            label_visibility="collapsed",
+        )
+    with colF:
+        st.session_state.fan_mode = st.selectbox(
+            "Fan Mode",
+            ["Auto", "On"],
+            index=["Auto", "On"].index(st.session_state.fan_mode),
+            label_visibility="collapsed",
+        )
+
+    # Heat / Cool setpoint pills
+    st.markdown(
+        f"""
         <div class="pillRow">
           <div class="pill heat">
             <div class="label">{ico('🔥')} Heat</div>
@@ -470,7 +527,6 @@ elif st.session_state.view == "Dial":
     plus = st.button("＋", key="dial_plus")
     minus = st.button("－", key="dial_minus")
     st.markdown("</div>", unsafe_allow_html=True)
-
     st.markdown("</div>", unsafe_allow_html=True)
 
     if plus:
@@ -487,33 +543,16 @@ elif st.session_state.view == "Dial":
 
 elif st.session_state.view == "Reports":
     topbar("Reports", left_symbol="＋", right_symbol="👤")
-    st.markdown(
-        f"""
-        <div style="background: rgba(31,41,55,0.9); border: 1px solid rgba(255,255,255,0.08);
-                    border-radius: 18px; padding: 14px 14px;">
-          <div style="font-size:18px; font-weight:650; margin-bottom:8px;">Quick Stats</div>
-          <div style="color:rgba(255,255,255,0.72); line-height:1.5;">
-            • Indoor temp: <b>{st.session_state.indoor_temp}</b><br/>
-            • HVAC mode: <b>{st.session_state.hvac_mode}</b><br/>
-            • Humidity: <b>{st.session_state.humidity}%</b><br/>
-            • Comfort: <b>{st.session_state.comfort}</b> ({comfort_icon(st.session_state.comfort)})<br/>
-          </div>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
+    st.write("Reports placeholder (connect telemetry later).")
 
 elif st.session_state.view == "Menu":
     topbar("Main Menu", left_symbol="✕", right_symbol="")
-    st.text_input("Search thermostat settings", placeholder="Search thermostat settings")
-
     if st.button("Open Comfort Settings", use_container_width=True):
         st.session_state.view = "Comfort"
         st.rerun()
 
 elif st.session_state.view == "Comfort":
     topbar("Comfort Settings", left_symbol="←", right_symbol="＋")
-
     st.markdown(
         """
         <div style="color:rgba(255,255,255,0.7); font-size:15px; line-height:1.4; margin-bottom:14px;">
