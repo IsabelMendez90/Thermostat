@@ -53,6 +53,7 @@ def init_state():
     # Location + weather
     ss.setdefault("location", "Berkeley, CA")
     ss.setdefault("outdoor_temp_f", None)  # float or None
+    ss.setdefault("outdoor_humidity", None)  # float or None
     ss.setdefault("weather_status", "Not updated")
 
     # Geocoding candidates
@@ -109,20 +110,20 @@ def geocode_candidates(location_text: str) -> Tuple[List[dict], str]:
         gj = geo.json()
         results = gj.get("results") or []
         if not results:
-            # Helpful hint for the exact case you mentioned
-            return [], f"No matches for '{q}'. Try: 'Berkeley California USA' (this one always works)."
+            return [], f"No matches for '{q}'. Try a more complete address like 'Berkeley, California, USA'."
         return results, f"Found {len(results)} match(es) for '{q}'."
     except Exception as e:
         return [], f"Geocoding error: {e}"
 
-def fetch_current_weather_f(lat: float, lon: float) -> Tuple[Optional[float], str]:
+def fetch_current_weather(lat: float, lon: float) -> Tuple[Optional[float], Optional[float], str]:
+    """Fetch temperature (F) and humidity (%) from Open-Meteo"""
     try:
         wx = requests.get(
             "https://api.open-meteo.com/v1/forecast",
             params={
                 "latitude": lat,
                 "longitude": lon,
-                "current_weather": True,
+                "current": "temperature_2m,relative_humidity_2m",
                 "temperature_unit": "fahrenheit",
                 "wind_speed_unit": "mph",
             },
@@ -130,12 +131,21 @@ def fetch_current_weather_f(lat: float, lon: float) -> Tuple[Optional[float], st
         )
         wx.raise_for_status()
         wj = wx.json()
-        cw = wj.get("current_weather", {})
-        if "temperature" not in cw:
-            return None, "Weather unavailable (no temperature in response)."
-        return float(cw["temperature"]), "OK"
+        current = wj.get("current", {})
+        
+        temp = current.get("temperature_2m")
+        humidity = current.get("relative_humidity_2m")
+        
+        if temp is None:
+            return None, None, "Weather data unavailable (no temperature in response)"
+        
+        return float(temp), float(humidity) if humidity is not None else None, "OK"
+    except requests.exceptions.Timeout:
+        return None, None, "Weather request timed out. Try again."
+    except requests.exceptions.RequestException as e:
+        return None, None, f"Weather API error: {str(e)}"
     except Exception as e:
-        return None, f"Weather error: {e}"
+        return None, None, f"Unexpected error: {str(e)}"
 
 def nice_place(r: dict) -> str:
     name = r.get("name", "")
@@ -161,7 +171,8 @@ def thermostat_state_summary() -> Dict[str, Any]:
     return {
         "indoor_temp_f": st.session_state.indoor_temp,
         "outdoor_temp_f": st.session_state.outdoor_temp_f,
-        "humidity_pct": st.session_state.humidity,
+        "outdoor_humidity_pct": st.session_state.outdoor_humidity,
+        "indoor_humidity_pct": st.session_state.humidity,
         "air_quality": st.session_state.air_quality,
         "hvac_mode": st.session_state.hvac_mode,
         "fan": fan_label(),
@@ -285,6 +296,7 @@ def apply_action(action: Dict[str, Any]) -> str:
             return "Invalid location"
         st.session_state.location = loc
         st.session_state.outdoor_temp_f = None
+        st.session_state.outdoor_humidity = None
         st.session_state.weather_status = "Not updated"
         st.session_state.geo_results = []
         st.session_state.geo_choice = 0
@@ -612,9 +624,12 @@ if st.session_state.view == "Home":
     heat_sp = get_sp(st.session_state.comfort, "heat")
     cool_sp = get_sp(st.session_state.comfort, "cool")
 
+    # Build outdoor weather display
     outdoor_chip = "Outdoor: —"
     if st.session_state.outdoor_temp_f is not None:
         outdoor_chip = f"Outdoor: {st.session_state.outdoor_temp_f:.0f}°F"
+        if st.session_state.outdoor_humidity is not None:
+            outdoor_chip += f", {st.session_state.outdoor_humidity:.0f}% RH"
 
     st.markdown(
         f"""
@@ -682,65 +697,76 @@ if st.session_state.view == "Home":
 
     st.markdown("<div style='height:10px'></div>", unsafe_allow_html=True)
 
-    # Location + outdoor temperature update (robust)
-    st.session_state.location = st.text_input("Location", value=st.session_state.location, label_visibility="collapsed")
+    # ===== IMPROVED WEATHER UPDATE SECTION =====
+    st.markdown("### 🌤️ Outdoor Weather")
+    
+    st.session_state.location = st.text_input(
+        "Location", 
+        value=st.session_state.location, 
+        placeholder="e.g., Berkeley, California, USA",
+        label_visibility="collapsed"
+    )
 
-    cL1, cL2 = st.columns([1.0, 1.0])
-    with cL1:
-        if st.button("Find location", use_container_width=True):
-            results, status = geocode_candidates(st.session_state.location)
-            st.session_state.geo_results = results
-            st.session_state.geo_choice = 0
-            st.session_state.weather_status = status
-            # Make the assistant bubble show it too
-            st.session_state.assistant_last_reply = status
-            st.rerun()
-
-    with cL2:
-        if st.button("Update outdoor temp", use_container_width=True):
-            results = st.session_state.geo_results
-
+    if st.button("🔄 Update Outdoor Weather", use_container_width=True):
+        with st.spinner("Fetching location and weather..."):
+            # Step 1: Geocode
+            results, geo_status = geocode_candidates(st.session_state.location)
+            
             if not results:
-                results, status = geocode_candidates(st.session_state.location)
-                st.session_state.geo_results = results
-                st.session_state.weather_status = status
-                if not results:
-                    st.session_state.outdoor_temp_f = None
-                    st.session_state.assistant_last_reply = status
-                    st.rerun()
-
-            idx = min(int(st.session_state.geo_choice), len(st.session_state.geo_results) - 1)
-            chosen = st.session_state.geo_results[idx]
+                st.session_state.weather_status = geo_status
+                st.session_state.outdoor_temp_f = None
+                st.session_state.outdoor_humidity = None
+                st.session_state.assistant_last_reply = f"❌ {geo_status}"
+                st.rerun()
+            
+            # Step 2: Use first result (or user's choice if they selected one)
+            st.session_state.geo_results = results
+            idx = min(int(st.session_state.geo_choice), len(results) - 1)
+            chosen = results[idx]
             lat, lon = chosen["latitude"], chosen["longitude"]
-
-            temp_f, ok = fetch_current_weather_f(lat, lon)
             place = nice_place(chosen)
-
+            
+            # Step 3: Fetch weather
+            temp_f, humidity, weather_status = fetch_current_weather(lat, lon)
+            
             if temp_f is None:
                 st.session_state.outdoor_temp_f = None
-                st.session_state.weather_status = f"{ok} For {place}"
+                st.session_state.outdoor_humidity = None
+                st.session_state.weather_status = f"❌ {weather_status} for {place}"
                 st.session_state.assistant_last_reply = st.session_state.weather_status
             else:
                 st.session_state.outdoor_temp_f = temp_f
-                st.session_state.weather_status = f"Updated from Open-Meteo for {place}"
-                st.session_state.assistant_last_reply = f"{st.session_state.weather_status}. Outdoor now {temp_f:.0f}°F."
-
+                st.session_state.outdoor_humidity = humidity
+                humidity_text = f", {humidity:.0f}% RH" if humidity else ""
+                st.session_state.weather_status = f"✅ Updated for {place}"
+                st.session_state.assistant_last_reply = f"Weather updated! {temp_f:.0f}°F{humidity_text} in {place}"
+            
             st.rerun()
 
-    # If candidates exist, let user pick the correct one (this fixes 'Berkeley, CA' edge cases)
-    if st.session_state.geo_results:
+    # Show multiple location candidates if available
+    if st.session_state.geo_results and len(st.session_state.geo_results) > 1:
+        st.markdown("**Multiple locations found. Select the correct one:**")
         labels = [
             f"{nice_place(r)} • ({r.get('latitude'):.3f}, {r.get('longitude'):.3f})"
             for r in st.session_state.geo_results
         ]
         st.session_state.geo_choice = st.selectbox(
-            "Select match",
+            "Select location",
             list(range(len(labels))),
             index=min(st.session_state.geo_choice, len(labels)-1),
             format_func=lambda i: labels[i],
+            label_visibility="collapsed"
         )
+        st.info("After selecting, click 'Update Outdoor Weather' again to fetch weather for this location.")
 
-    st.caption(st.session_state.weather_status)
+    # Status display
+    if st.session_state.weather_status != "Not updated":
+        if "✅" in st.session_state.weather_status:
+            st.success(st.session_state.weather_status)
+        elif "❌" in st.session_state.weather_status:
+            st.error(st.session_state.weather_status)
+        else:
+            st.info(st.session_state.weather_status)
 
 elif st.session_state.view == "Dial":
     target = st.session_state.dial_target
