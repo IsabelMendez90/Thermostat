@@ -52,7 +52,7 @@ def init_state():
     ss.setdefault("pending_explainer", "")  # why/impact text
 
     # Location + weather
-    ss.setdefault("location", "Berkeley, CA")
+    ss.setdefault("location", "Berkeley, California")
     ss.setdefault("outdoor_temp_f", None)  # float or None
     ss.setdefault("outdoor_humidity", None)  # float or None
     ss.setdefault("weather_status", "Not updated")
