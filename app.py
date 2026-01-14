@@ -95,6 +95,36 @@ def fan_label() -> str:
 # Weather via Open-Meteo (free, no key)
 #   - Geocoding returns multiple candidates; user picks one
 # =========================================================
+def get_location_from_ip() -> Tuple[Optional[str], Optional[float], Optional[float], str]:
+    """Auto-detect location from IP address. Returns (city_name, lat, lon, status)"""
+    try:
+        response = requests.get('http://ip-api.com/json/', timeout=10)
+        response.raise_for_status()
+        data = response.json()
+        
+        if data.get('status') != 'success':
+            return None, None, None, f"Could not detect location: {data.get('message', 'Unknown error')}"
+        
+        city = data.get('city', '')
+        region = data.get('regionName', '')
+        country = data.get('country', '')
+        lat = data.get('lat')
+        lon = data.get('lon')
+        
+        # Build a nice location string
+        location_parts = [p for p in [city, region, country] if p]
+        location_str = ", ".join(location_parts) if location_parts else None
+        
+        if not location_str or lat is None or lon is None:
+            return None, None, None, "Incomplete location data from IP"
+        
+        return location_str, float(lat), float(lon), "OK"
+    
+    except requests.exceptions.Timeout:
+        return None, None, None, "Location detection timed out"
+    except Exception as e:
+        return None, None, None, f"Location detection error: {str(e)}"
+
 def geocode_candidates(location_text: str) -> Tuple[List[dict], str]:
     q = (location_text or "").strip()
     if not q:
@@ -700,12 +730,45 @@ if st.session_state.view == "Home":
     # ===== IMPROVED WEATHER UPDATE SECTION =====
     st.markdown("### 🌤️ Outdoor Weather")
     
-    st.session_state.location = st.text_input(
-        "Location", 
-        value=st.session_state.location, 
-        placeholder="e.g., Berkeley, California, USA",
-        label_visibility="collapsed"
-    )
+    # Location input and auto-detect button
+    col_input, col_auto = st.columns([2, 1])
+    with col_input:
+        st.session_state.location = st.text_input(
+            "Location", 
+            value=st.session_state.location, 
+            placeholder="e.g., Berkeley, California, USA",
+            label_visibility="collapsed"
+        )
+    with col_auto:
+        if st.button("📍 Auto", use_container_width=True, help="Auto-detect location from IP"):
+            with st.spinner("Detecting location..."):
+                location_str, lat, lon, status = get_location_from_ip()
+                
+                if location_str and lat and lon:
+                    st.session_state.location = location_str
+                    # Immediately fetch weather for detected location
+                    temp_f, humidity, weather_status = fetch_current_weather(lat, lon)
+                    
+                    if temp_f is None:
+                        st.session_state.outdoor_temp_f = None
+                        st.session_state.outdoor_humidity = None
+                        st.session_state.weather_status = f"❌ {weather_status} for {location_str}"
+                        st.session_state.assistant_last_reply = st.session_state.weather_status
+                    else:
+                        st.session_state.outdoor_temp_f = temp_f
+                        st.session_state.outdoor_humidity = humidity
+                        humidity_text = f", {humidity:.0f}% RH" if humidity else ""
+                        st.session_state.weather_status = f"✅ Auto-detected: {location_str}"
+                        st.session_state.assistant_last_reply = f"Location detected! {temp_f:.0f}°F{humidity_text} in {location_str}"
+                    
+                    # Clear any previous geocoding results
+                    st.session_state.geo_results = []
+                    st.session_state.geo_choice = 0
+                else:
+                    st.session_state.assistant_last_reply = f"❌ {status}"
+                    st.session_state.weather_status = status
+                
+                st.rerun()
 
     if st.button("🔄 Update Outdoor Weather", use_container_width=True):
         with st.spinner("Fetching location and weather..."):
