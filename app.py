@@ -9,6 +9,7 @@ from typing import Any, Dict, Optional, Tuple, List
 import requests
 import streamlit as st
 from openai import OpenAI
+from streamlit_js_eval import get_geolocation
 
 # =========================================================
 # Page config
@@ -94,37 +95,8 @@ def fan_label() -> str:
 # =========================================================
 # Weather via Open-Meteo (free, no key)
 #   - Geocoding returns multiple candidates; user picks one
+#   - Browser geolocation uses GPS for accurate location
 # =========================================================
-def get_location_from_ip() -> Tuple[Optional[str], Optional[float], Optional[float], str]:
-    """Auto-detect location from IP address. Returns (city_name, lat, lon, status)"""
-    try:
-        response = requests.get('http://ip-api.com/json/', timeout=10)
-        response.raise_for_status()
-        data = response.json()
-        
-        if data.get('status') != 'success':
-            return None, None, None, f"Could not detect location: {data.get('message', 'Unknown error')}"
-        
-        city = data.get('city', '')
-        region = data.get('regionName', '')
-        country = data.get('country', '')
-        lat = data.get('lat')
-        lon = data.get('lon')
-        
-        # Build a nice location string
-        location_parts = [p for p in [city, region, country] if p]
-        location_str = ", ".join(location_parts) if location_parts else None
-        
-        if not location_str or lat is None or lon is None:
-            return None, None, None, "Incomplete location data from IP"
-        
-        return location_str, float(lat), float(lon), "OK"
-    
-    except requests.exceptions.Timeout:
-        return None, None, None, "Location detection timed out"
-    except Exception as e:
-        return None, None, None, f"Location detection error: {str(e)}"
-
 def geocode_candidates(location_text: str) -> Tuple[List[dict], str]:
     q = (location_text or "").strip()
     if not q:
@@ -740,12 +712,40 @@ if st.session_state.view == "Home":
             label_visibility="collapsed"
         )
     with col_auto:
-        if st.button("📍 Auto", use_container_width=True, help="Auto-detect location from IP"):
-            with st.spinner("Detecting location..."):
-                location_str, lat, lon, status = get_location_from_ip()
+        if st.button("📍 Auto", use_container_width=True, help="Auto-detect location using GPS"):
+            with st.spinner("Getting your location..."):
+                # Get browser geolocation (GPS-based, much more accurate!)
+                loc = get_geolocation()
                 
-                if location_str and lat and lon:
+                if loc and 'coords' in loc:
+                    lat = loc['coords']['latitude']
+                    lon = loc['coords']['longitude']
+                    
+                    # Reverse geocode to get city name
+                    try:
+                        reverse_geo = requests.get(
+                            "https://geocoding-api.open-meteo.com/v1/search",
+                            params={
+                                "name": f"{lat},{lon}",
+                                "count": 1,
+                                "language": "en",
+                                "format": "json"
+                            },
+                            timeout=10
+                        )
+                        reverse_geo.raise_for_status()
+                        geo_data = reverse_geo.json()
+                        
+                        if geo_data.get('results'):
+                            result = geo_data['results'][0]
+                            location_str = nice_place(result)
+                        else:
+                            location_str = f"{lat:.4f}, {lon:.4f}"
+                    except:
+                        location_str = f"{lat:.4f}, {lon:.4f}"
+                    
                     st.session_state.location = location_str
+                    
                     # Immediately fetch weather for detected location
                     temp_f, humidity, weather_status = fetch_current_weather(lat, lon)
                     
@@ -758,15 +758,15 @@ if st.session_state.view == "Home":
                         st.session_state.outdoor_temp_f = temp_f
                         st.session_state.outdoor_humidity = humidity
                         humidity_text = f", {humidity:.0f}% RH" if humidity else ""
-                        st.session_state.weather_status = f"✅ Auto-detected: {location_str}"
+                        st.session_state.weather_status = f"✅ GPS location: {location_str}"
                         st.session_state.assistant_last_reply = f"Location detected! {temp_f:.0f}°F{humidity_text} in {location_str}"
                     
                     # Clear any previous geocoding results
                     st.session_state.geo_results = []
                     st.session_state.geo_choice = 0
                 else:
-                    st.session_state.assistant_last_reply = f"❌ {status}"
-                    st.session_state.weather_status = status
+                    st.session_state.assistant_last_reply = "❌ Could not access location. Please allow location access in your browser or enter manually."
+                    st.session_state.weather_status = "Location access denied or unavailable"
                 
                 st.rerun()
 
