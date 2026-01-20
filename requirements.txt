@@ -1,6 +1,11 @@
 streamlit
-openai
 pandas
 numpy
 requests
+plotly
+pyarrow
+openai
+rapidfuzz
+xgboost
+joblib
 streamlit-js-eval
